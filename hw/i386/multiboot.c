@@ -195,11 +195,6 @@ int load_multiboot(X86MachineState *x86ms,
         int kernel_size;
         fclose(f);
 
-        if (((struct elf64_hdr*)header)->e_machine == EM_X86_64) {
-            error_report("Cannot load x86-64 image, give a 32bit one.");
-            exit(1);
-        }
-
         kernel_size = load_elf(kernel_filename, NULL, NULL, NULL, &elf_entry,
                                &elf_low, &elf_high, NULL, 0, I386_ELF_MACHINE,
                                0, 0);
