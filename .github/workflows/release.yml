@@ -42,4 +42,4 @@ jobs:
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
           prerelease: true
           automatic_release_tag: "jf-test-release"
-          files: qemu.tar.gz
+          files: build/qemu.tar.gz
