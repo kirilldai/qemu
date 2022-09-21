@@ -287,8 +287,8 @@ static bool fwdfpga_xdma_engine_start(FwdFpgaXdmaEngine* engine) {
         return false;
     }
 
-    // Need to set this here to avoid race condiiton: after control register
-    // is written, status register must indicate busy.
+    // Need to set this here to avoid race condition: after control register
+    // is written, status register must indicate busy immediately.
     qemu_mutex_lock(engine->bar_mutex);
     engine->channel->status = 0x01; // busy, reset error bits
     qemu_mutex_unlock(engine->bar_mutex);
