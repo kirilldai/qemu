@@ -2,6 +2,8 @@
 
 QEMU_DIR=$(dirname ${BASH_SOURCE})
 
+echo "#${QEMU_DIR}# #${BASH_SOURCE}#"
+
 # create
 rm -rf build/
 mkdir build/
