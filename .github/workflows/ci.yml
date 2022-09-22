@@ -1,0 +1,43 @@
+name: Build qemu release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - 'ddln*'
+
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  release:
+    name: CI
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: true
+
+    steps:
+      - name: Install Ninja
+        uses: llvm/actions/install-ninja@main
+      - name: Checkout
+        uses: actions/checkout@v1
+        with:
+          fetch-depth: 250
+      - name: Build and package
+        run: ./build.sh
+      - uses: actions/upload-artifact@v3
+        with:
+          name: qemu-release
+          path: build/qemu.tar.gz
+      - name: Create release
+        if: github.event_name == 'push'
+        uses: marvinpinto/action-automatic-releases@v1.2.1
+        with:
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          prerelease: false
+          files: build/qemu.tar.gz

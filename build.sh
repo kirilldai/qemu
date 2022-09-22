@@ -1,6 +1,6 @@
 #!/bin/bash -ex
 
-QEMU_DIR=$(dirname ${BASH_SOURCE})
+QEMU_DIR=$(dirname "$(readlink -f "${BASH_SOURCE}}")")
 
 # create
 rm -rf build/
