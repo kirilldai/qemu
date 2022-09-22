@@ -9,7 +9,7 @@ cd build
 
 # make qemu
 ${QEMU_DIR}/configure --target-list="x86_64-softmmu"
-make -j8
+ninja -j8
 
 # copy relevant build outputs
 mkdir -p qemu/pc-bios
