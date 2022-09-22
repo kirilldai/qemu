@@ -51,7 +51,9 @@ const size_t FPGA_DRAM_SIZE = 1024 * 1024 * 1024;
 // for the other structures, including tables, 40, 41, 42, 45, 48, 96, 97,
 // 108-115.
 
-typedef struct [[gnu::packed]] XdmaDescriptor {
+#pragma pack(1)
+
+typedef struct XdmaDescriptor {
     uint8_t control;
     uint8_t nextAdj;
     uint16_t magic;  // 0xad4b;
@@ -61,7 +63,7 @@ typedef struct [[gnu::packed]] XdmaDescriptor {
     uint64_t nxtAddress;
 } XdmaDescriptor;
 
-typedef struct [[gnu::packed]] XdmaChannel {
+typedef struct XdmaChannel {
     uint32_t identifier;  // 0x1fc0 or 0x1fc1
     uint32_t control;
     uint32_t unused1[0x0e];
@@ -71,7 +73,7 @@ typedef struct [[gnu::packed]] XdmaChannel {
     uint32_t unused3[0x2c];
 } XdmaChannel;
 
-typedef struct [[gnu::packed]] XdmaSgdma {
+typedef struct XdmaSgdma {
     uint32_t identifier;  // 0x1fc4 or 0x1fc5
     uint32_t unused1[31];
 
@@ -81,7 +83,7 @@ typedef struct [[gnu::packed]] XdmaSgdma {
     uint32_t unused2[0x1c];
 } XdmaSgdma;
 
-typedef struct [[gnu::packed]] XdmaBar {
+typedef struct XdmaBar {
     XdmaChannel h2cChannel0;
     XdmaChannel h2cChannel1;
     uint8_t padding1[0x0e00];
@@ -97,6 +99,8 @@ typedef struct [[gnu::packed]] XdmaBar {
     XdmaSgdma c2hSgdma1;
     uint8_t padding5[0x2e00];
 } XdmaBar;
+
+#pragma pack()
 
 typedef enum FwdFpgaXdmaEngineDirection {
     FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C,
