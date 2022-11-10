@@ -98,6 +98,7 @@ typedef struct XdmaBar {
     XdmaSgdma c2hSgdma0;
     XdmaSgdma c2hSgdma1;
     uint8_t padding5[0x2e00];
+    uint8_t unused[0xF8000];
 } XdmaBar;
 
 #pragma pack()
@@ -430,7 +431,7 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
 
     memory_region_init_io(&fwdfpga->mmio, OBJECT(fwdfpga), &fwdfpga_mmio_ops, fwdfpga,
             "fwdfpga-mmio", sizeof(XdmaBar));
-    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &fwdfpga->mmio);
+    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, &fwdfpga->mmio);
 }
 
 static void pci_fwdfpga_uninit(PCIDevice *pdev)
