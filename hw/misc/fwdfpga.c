@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "hw/pci/pci.h"
+#include "hw/qdev-properties.h"
 #include "hw/hw.h"
 #include "qom/object.h"
 #include "qemu/module.h"
@@ -98,7 +99,6 @@ typedef struct XdmaBar {
     XdmaSgdma c2hSgdma0;
     XdmaSgdma c2hSgdma1;
     uint8_t padding5[0x2e00];
-    uint8_t unused[0xF8000];
 } XdmaBar;
 
 #pragma pack()
@@ -130,6 +130,9 @@ struct FwdFpgaState {
     QemuMutex bar_mutex;
     XdmaBar bar;
     void* fpga_dram;
+
+    uint8_t xdma_bar_id;
+    uint32_t xdma_bar_size;
 
     FwdFpgaXdmaEngine h2c_engines[2];
     FwdFpgaXdmaEngine c2h_engines[2];
@@ -320,7 +323,12 @@ static uint64_t fwdfpga_mmio_read(void *opaque, hwaddr addr, unsigned size)
     FwdFpgaState *fwdfpga = opaque;
     uint64_t val = ~0ULL;
     qemu_mutex_lock(&fwdfpga->bar_mutex);
-    memcpy(&val, (uint8_t*)&fwdfpga->bar + addr, size);
+    if (addr < sizeof(fwdfpga->bar)) {
+      if (addr + size > sizeof(fwdfpga->bar)) {
+        size = sizeof(fwdfpga->bar) - addr;
+      }
+      memcpy(&val, (uint8_t*)&fwdfpga->bar + addr, size);
+    }
     qemu_mutex_unlock(&fwdfpga->bar_mutex);
     return val;
 }
@@ -421,7 +429,7 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
             .c2hSgdma0 = {.identifier = 0x1fc50006},
             .c2hSgdma1 = {.identifier = 0x1fc50106},
     };
-    
+
     fwdfpga->bar = bar;
 
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
@@ -430,8 +438,8 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
     fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->bar.c2hChannel1, &fwdfpga->bar.c2hSgdma1);
 
     memory_region_init_io(&fwdfpga->mmio, OBJECT(fwdfpga), &fwdfpga_mmio_ops, fwdfpga,
-            "fwdfpga-mmio", sizeof(XdmaBar));
-    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, &fwdfpga->mmio);
+            "fwdfpga-mmio", fwdfpga->xdma_bar_size);
+    pci_register_bar(pdev, fwdfpga->xdma_bar_id, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, &fwdfpga->mmio);
 }
 
 static void pci_fwdfpga_uninit(PCIDevice *pdev)
@@ -452,6 +460,12 @@ static void pci_fwdfpga_uninit(PCIDevice *pdev)
     }
 }
 
+static Property fwdfga_props[] = {
+        DEFINE_PROP_UINT8("xdma-bar-id", FwdFpgaState, xdma_bar_id, 0),
+        DEFINE_PROP_UINT32("xdma-bar-size", FwdFpgaState, xdma_bar_size, sizeof(XdmaBar)),
+        DEFINE_PROP_END_OF_LIST()
+};
+
 static void fwdfpga_instance_init(Object *obj)
 {
     FwdFpgaState *fwdfpga = FWD_FPGA(obj);
@@ -470,6 +484,8 @@ static void fwdfpga_class_init(ObjectClass *class, void *data)
     k->revision = 0x10;
     k->class_id = PCI_CLASS_OTHERS;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+
+    device_class_set_props(dc, fwdfga_props);
 }
 
 static void pci_fwdfpga_register_types(void)
