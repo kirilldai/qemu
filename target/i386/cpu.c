@@ -5575,6 +5575,14 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         }
         break;
     }
+    case 0x15: {
+        /* Intel Time Stamp Counter and Nominal Core Crystal Clock Information */
+        *eax = 1; // denominator
+        *ebx = 1000; // numerator (1KHz)
+        *ecx = env->tsc_khz;
+        *edx = 0;
+        break;
+    }
     case 0x40000000:
         /*
          * CPUID code in kvm_arch_init_vcpu() ignores stuff

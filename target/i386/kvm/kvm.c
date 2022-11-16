@@ -1781,6 +1781,13 @@ int kvm_arch_init_vcpu(CPUState *cs)
             }
             break;
         }
+        case 0x15: {
+            c->function = i;
+            c->flags = 0;
+            c->index = 0;
+            cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
+            break;
+        }
         default:
             c->function = i;
             c->flags = 0;
