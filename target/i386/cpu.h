@@ -542,6 +542,10 @@ typedef enum X86Seg {
 #define MSR_IA32_VMX_TRUE_ENTRY_CTLS     0x00000490
 #define MSR_IA32_VMX_VMFUNC             0x00000491
 
+#define MSR_IA32_PQR_ASSOC              0x00000c8fu
+#define MSR_IA32_L3_MASK_0              0x00000c90u
+#define MSR_IA32_L2_MASK_0              0x00000d10u
+
 #define XSTATE_FP_BIT                   0
 #define XSTATE_SSE_BIT                  1
 #define XSTATE_YMM_BIT                  2
@@ -575,7 +579,6 @@ typedef enum X86Seg {
 
 #define ESA_FEATURE_ALIGN64_MASK        (1U << ESA_FEATURE_ALIGN64_BIT)
 #define ESA_FEATURE_XFD_MASK            (1U << ESA_FEATURE_XFD_BIT)
-
 
 /* CPUID feature bits available in XCR0 */
 #define CPUID_XSTATE_XCR0_MASK  (XSTATE_FP_MASK | XSTATE_SSE_MASK | \
@@ -793,6 +796,8 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define CPUID_7_0_EBX_RTM               (1U << 11)
 /* Memory Protection Extension */
 #define CPUID_7_0_EBX_MPX               (1U << 14)
+/* RDT-A. Intel Resource Director Technology */
+#define CPUID_7_0_EBX_RDT_A             (1U << 15)
 /* AVX-512 Foundation */
 #define CPUID_7_0_EBX_AVX512F           (1U << 16)
 /* AVX-512 Doubleword & Quadword Instruction */
@@ -903,6 +908,9 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 /* XFD Extend Feature Disabled */
 #define CPUID_D_1_EAX_XFD               (1U << 4)
 
+/* L2 CAT support */
+#define CPUID_10_0_EBX_L2_CAT           (1U << 2)
+
 /* Packets which contain IP payload have LIP values */
 #define CPUID_14_0_ECX_LIP              (1U << 31)
 
@@ -1012,7 +1020,6 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define MSR_VMX_EPT_INVVPID_SINGLE_CONTEXT_NOGLOBALS (1ULL << 43)
 
 #define MSR_VMX_VMFUNC_EPT_SWITCHING                 (1ULL << 0)
-
 
 /* VMX controls */
 #define VMX_CPU_BASED_VIRTUAL_INTR_PENDING          0x00000004
@@ -1353,6 +1360,16 @@ typedef struct {
  */
 #define UNASSIGNED_APIC_ID 0xFFFFFFFF
 
+// The following value is the architectural maximum supported COS numbers.
+// Each processor might have a different number.
+// Software must query CPUID(eax=10h, ecx=2h) to discover the number of available COS
+#define MAX_ARCH_L2_COS 16
+
+// The following value is the architectural maximum supported COS numbers.
+// Each processor might have a different number.
+// Software must query CPUID(eax=10h, ecx=1h) to discover the number of available COS
+#define MAX_ARCH_L3_COS 16
+
 typedef union X86LegacyXSaveArea {
     struct {
         uint16_t fcw;
@@ -1519,7 +1536,6 @@ typedef struct CPUCacheInfo {
     bool complex_indexing;
 } CPUCacheInfo;
 
-
 typedef struct CPUCaches {
         CPUCacheInfo *l1d_cache;
         CPUCacheInfo *l1i_cache;
@@ -1635,6 +1651,9 @@ typedef struct CPUArchState {
     uint64_t msr_gp_counters[MAX_GP_COUNTERS];
     uint64_t msr_gp_evtsel[MAX_GP_COUNTERS];
 
+    uint64_t msr_ia32_pqr_assoc;
+    uint64_t msr_ia32_l3_mask[MAX_ARCH_L3_COS];
+    uint64_t msr_ia32_l2_mask[MAX_ARCH_L2_COS];
     uint64_t pat;
     uint32_t smbase;
     uint64_t msr_smi_count;
@@ -1964,8 +1983,9 @@ struct ArchCPU {
     int32_t thread_id;
 
     int32_t hv_max_vps;
-};
 
+    bool emulate_rdt_a;
+};
 
 #ifndef CONFIG_USER_ONLY
 extern const VMStateDescription vmstate_x86_cpu;

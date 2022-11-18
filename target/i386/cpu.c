@@ -5382,6 +5382,10 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                     CPUID_7_0_ECX_SGX_LC))) {
                 *ecx &= ~CPUID_7_0_ECX_SGX_LC;
             }
+
+            if (cpu->emulate_rdt_a) {
+              *ebx |= CPUID_7_0_EBX_RDT_A;
+            }
         } else if (count == 1) {
             *eax = env->features[FEAT_7_1_EAX];
             *ebx = 0;
@@ -5538,6 +5542,34 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         }
         break;
     }
+    case 0x10:
+        /* Intel Resource Director Technology Allocation Enumeration Leaf */
+        *eax = 0;
+        *ebx = 0;
+        *ecx = 0;
+        *edx = 0;
+        if (count == 0) {
+            /* Intel Resource Director Technology Allocation Enumeration Subleaf */
+            if (cpu->emulate_rdt_a) {
+                // Hardcode L2 CAT support.
+                *ebx |= CPUID_10_0_EBX_L2_CAT;
+                // Note that L3 CAT support is not enabled because it is not
+                // architectural and the tigerlake i7-1185GRE processor reports 0
+                // even though it is supported
+            }
+        } else if (count == 1) {
+            // Note that L3 CAT capacity bitmask length and COS are not reported
+            // because support for L3 CAT is not architectural for the tigerlake
+            // i7-1185GRE processor and it reports 0 even though it is supported
+        } else if (count == 2) {
+            /* L2 Cache Allocation Technology Enumeration Sub-leaf */
+            if (cpu->emulate_rdt_a) {
+                // Hardcode L2 config for a tigerlake i7-1185GRE
+                *eax = 19; // Capacity bitmask len for i7-1185GRE
+                *edx = 7; // MAX COS for i7-1185GRE
+            }
+        }
+        break;
     case 0x12:
 #ifndef CONFIG_USER_ONLY
         if (!kvm_enabled() ||
@@ -7069,6 +7101,8 @@ static Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("tcg-cpuid", X86CPU, expose_tcg, true),
     DEFINE_PROP_BOOL("x-migrate-smi-count", X86CPU, migrate_smi_count,
                      true),
+    DEFINE_PROP_BOOL("emulate-rdt-a", X86CPU, emulate_rdt_a,
+                     false),
     /*
      * lecacy_cache defaults to true unless the CPU model provides its
      * own cache information (see x86_cpu_load_def()).

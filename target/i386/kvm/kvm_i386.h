@@ -61,6 +61,7 @@ typedef struct kvm_msr_handlers {
     uint32_t msr;
     QEMURDMSRHandler *rdmsr;
     QEMUWRMSRHandler *wrmsr;
+    uint32_t nmsrs;
 } KVMMSRHandlers;
 
 bool kvm_filter_msr(KVMState *s, uint32_t msr, QEMURDMSRHandler *rdmsr,

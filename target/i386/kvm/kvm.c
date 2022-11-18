@@ -147,6 +147,12 @@ static KVMMSRHandlers msr_handlers[KVM_MSR_FILTER_MAX_RANGES];
 static RateLimit bus_lock_ratelimit_ctrl;
 static int kvm_get_one_msr(X86CPU *cpu, int index, uint64_t *value);
 
+static bool kvm_filter_msr_range(KVMState *const s,
+                                 const uint32_t msr,
+                                 const uint32_t nmsrs,
+                                 QEMURDMSRHandler *const rdmsr,
+                                 QEMUWRMSRHandler *const wrmsr);
+
 int kvm_has_pit_state2(void)
 {
     return has_pit_state2;
@@ -1476,7 +1482,6 @@ static int hyperv_fill_cpuids(CPUState *cs,
         c->ebx |= HV_POST_MESSAGES | HV_SIGNAL_EVENTS;
     }
 
-
     /* Not exposed by KVM but needed to make CPU hotplug in Windows work */
     c->edx |= HV_CPU_DYNAMIC_PARTITIONING_AVAILABLE;
 
@@ -1941,6 +1946,26 @@ int kvm_arch_init_vcpu(CPUState *cs)
                 c->index = j;
                 c->flags = KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
                 cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
+            }
+            break;
+        }
+        case 0x10: {
+            for (j = 0; ; j++) {
+                c->function = i;
+                c->flags = KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+                c->index = j;
+                cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
+
+                if (j >= 2) {
+                    break;
+                }
+
+                if (cpuid_i == KVM_MAX_CPUID_ENTRIES) {
+                    fprintf(stderr, "cpuid_data is full, no space for "
+                                "cpuid(eax:0x%x,ecx:0x%x)\n", i, j);
+                    abort();
+                }
+                c = &cpuid_data.entries[cpuid_i++];
             }
             break;
         }
@@ -2424,6 +2449,52 @@ static bool kvm_rdmsr_core_thread_count(X86CPU *cpu, uint32_t msr,
 
     *val = cs->nr_threads * cs->nr_cores; /* thread count, bits 15..0 */
     *val |= ((uint32_t)cs->nr_cores << 16); /* core count, bits 31..16 */
+
+    return true;
+}
+
+static bool kvm_rdmsr_ia32_pqr_assoc(X86CPU *const cpu, const uint32_t msr,
+                                     uint64_t *const val)
+{
+    CPUX86State *env = &cpu->env;
+    *val = env->msr_ia32_pqr_assoc;
+    return true;
+}
+
+static bool kvm_wrmsr_ia32_pqr_assoc(X86CPU *const cpu, const uint32_t msr, const uint64_t val)
+{
+    CPUX86State *env = &cpu->env;
+    env->msr_ia32_pqr_assoc = val;
+    return true;
+}
+
+static bool kvm_rdmsr_ia32_l2_mask(X86CPU *const cpu, const uint32_t msr,
+                                     uint64_t *const val)
+{
+    CPUX86State *env = &cpu->env;
+    *val = env->msr_ia32_l2_mask[msr - MSR_IA32_L2_MASK_0];
+    return true;
+}
+
+static bool kvm_wrmsr_ia32_l2_mask(X86CPU *const cpu, const uint32_t msr, const uint64_t val)
+{
+    CPUX86State *env = &cpu->env;
+    env->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0] = val;
+    return true;
+}
+
+static bool kvm_rdmsr_ia32_l3_mask(X86CPU *const cpu, const uint32_t msr,
+                                     uint64_t *const val)
+{
+    CPUX86State *env = &cpu->env;
+    *val = env->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0];
+    return true;
+}
+
+static bool kvm_wrmsr_ia32_l3_mask(X86CPU *const cpu, const uint32_t msr, const uint64_t val)
+{
+    CPUX86State *env = &cpu->env;
+    env->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0] = val;
 
     return true;
 }
@@ -2920,7 +2991,6 @@ static int kvm_put_sregs2(X86CPU *cpu)
 
     return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_SREGS2, &sregs);
 }
-
 
 static void kvm_msr_buf_reset(X86CPU *cpu)
 {
@@ -3521,6 +3591,19 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
             }
         }
 
+        if (cpu->emulate_rdt_a) {
+            // If rtd-a is enabled then we shall support IA32_PQR_ASSOC, IA32_L3_MASK_n and IA32_L2_MASK_n
+            KVMState *const s = KVM_STATE(current_accel());
+
+            assert(kvm_vm_check_extension(s, KVM_CAP_X86_USER_SPACE_MSR));
+            assert(kvm_filter_msr(s, MSR_IA32_PQR_ASSOC,
+                               kvm_rdmsr_ia32_pqr_assoc, kvm_wrmsr_ia32_pqr_assoc)!= 0);
+            assert(kvm_filter_msr_range(s, MSR_IA32_L2_MASK_0, MAX_ARCH_L2_COS,
+                              kvm_rdmsr_ia32_l2_mask, kvm_wrmsr_ia32_l2_mask)!= 0);
+            assert(kvm_filter_msr_range(s, MSR_IA32_L3_MASK_0, MAX_ARCH_L3_COS,
+                              kvm_rdmsr_ia32_l3_mask, kvm_wrmsr_ia32_l3_mask)!= 0);
+        }
+
         /* Note: MSR_IA32_FEATURE_CONTROL is written separately, see
          *       kvm_put_msr_feature_control. */
     }
@@ -3540,7 +3623,6 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
 
     return kvm_buf_set_msrs(cpu);
 }
-
 
 static int kvm_get_fpu(X86CPU *cpu)
 {
@@ -5172,7 +5254,7 @@ static bool kvm_install_msr_filters(KVMState *s)
 
             *range = (struct kvm_msr_filter_range) {
                 .flags = 0,
-                .nmsrs = 1,
+                .nmsrs = handler->nmsrs,
                 .base = handler->msr,
                 .bitmap = (__u8 *)&zero,
             };
@@ -5195,6 +5277,35 @@ static bool kvm_install_msr_filters(KVMState *s)
     return true;
 }
 
+static bool kvm_filter_msr_range(KVMState *const s,
+                                 const uint32_t msr,
+                                 const uint32_t nmsrs,
+                                 QEMURDMSRHandler *const rdmsr,
+                                 QEMUWRMSRHandler *const wrmsr)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(msr_handlers); i++) {
+        if (!msr_handlers[i].msr) {
+            msr_handlers[i] = (KVMMSRHandlers) {
+                .msr = msr,
+                .rdmsr = rdmsr,
+                .wrmsr = wrmsr,
+                .nmsrs = nmsrs,
+            };
+
+            if (!kvm_install_msr_filters(s)) {
+                msr_handlers[i] = (KVMMSRHandlers) { };
+                return false;
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool kvm_filter_msr(KVMState *s, uint32_t msr, QEMURDMSRHandler *rdmsr,
                     QEMUWRMSRHandler *wrmsr)
 {
@@ -5206,6 +5317,7 @@ bool kvm_filter_msr(KVMState *s, uint32_t msr, QEMURDMSRHandler *rdmsr,
                 .msr = msr,
                 .rdmsr = rdmsr,
                 .wrmsr = wrmsr,
+                .nmsrs = 1,
             };
 
             if (!kvm_install_msr_filters(s)) {
@@ -5247,7 +5359,8 @@ static int kvm_handle_wrmsr(X86CPU *cpu, struct kvm_run *run)
 
     for (i = 0; i < ARRAY_SIZE(msr_handlers); i++) {
         KVMMSRHandlers *handler = &msr_handlers[i];
-        if (run->msr.index == handler->msr) {
+        if ((run->msr.index >= handler->msr) &&
+            (run->msr.index <  (handler->msr + handler->nmsrs))) {
             if (handler->wrmsr) {
                 r = handler->wrmsr(cpu, handler->msr, run->msr.data);
                 run->msr.error = r ? 0 : 1;
