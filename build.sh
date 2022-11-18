@@ -14,7 +14,7 @@ ninja -j8
 # copy relevant build outputs
 mkdir -p qemu/pc-bios
 cp qemu-system-x86_64 qemu
-cp pc-bios/*.bin pc-bios/*.rom qemu/pc-bios
+cp ../pc-bios/*.bin ../pc-bios/*.rom qemu/pc-bios
 
 # create BUILD.go file
 cat <<EOT > qemu/BUILD.go
