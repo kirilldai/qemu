@@ -8,7 +8,7 @@ mkdir build/
 cd build
 
 # make qemu
-${QEMU_DIR}/configure --target-list="x86_64-softmmu" --disable-vnc-jpeg --disable-vnc-png --disable-gtk --disable-sdl
+${QEMU_DIR}/configure --target-list="x86_64-softmmu" --disable-vnc --disable-gtk --disable-sdl
 ninja -j8
 
 # copy relevant build outputs

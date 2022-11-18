@@ -19,6 +19,7 @@ class BootLinuxX8664(LinuxTest):
     """
     :avocado: tags=arch:x86_64
     """
+    timeout = 480
 
     def test_pc_i440fx_tcg(self):
         """
@@ -63,6 +64,7 @@ class BootLinuxAarch64(LinuxTest):
     :avocado: tags=machine:virt
     :avocado: tags=machine:gic-version=2
     """
+    timeout = 240
 
     def add_common_args(self):
         self.vm.add_args('-bios',
@@ -79,6 +81,7 @@ class BootLinuxAarch64(LinuxTest):
         """
         self.require_accelerator("tcg")
         self.vm.add_args("-accel", "tcg")
+        self.vm.add_args("-cpu", "max,lpa2=off")
         self.vm.add_args("-machine", "virt,gic-version=2")
         self.add_common_args()
         self.launch_and_wait(set_up_ssh_connection=False)
@@ -91,6 +94,7 @@ class BootLinuxAarch64(LinuxTest):
         """
         self.require_accelerator("tcg")
         self.vm.add_args("-accel", "tcg")
+        self.vm.add_args("-cpu", "max,lpa2=off")
         self.vm.add_args("-machine", "virt,gic-version=3")
         self.add_common_args()
         self.launch_and_wait(set_up_ssh_connection=False)
@@ -112,6 +116,8 @@ class BootLinuxPPC64(LinuxTest):
     :avocado: tags=arch:ppc64
     """
 
+    timeout = 180
+
     def test_pseries_tcg(self):
         """
         :avocado: tags=machine:pseries
@@ -126,6 +132,8 @@ class BootLinuxS390X(LinuxTest):
     """
     :avocado: tags=arch:s390x
     """
+
+    timeout = 240
 
     @skipIf(os.getenv('GITLAB_CI'), 'Running on GitLab')
     def test_s390_ccw_virtio_tcg(self):
