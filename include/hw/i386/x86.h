@@ -39,6 +39,11 @@ struct X86MachineClass {
     bool fwcfg_dma_enabled;
 };
 
+// The following value is the architectural maximum supported COS numbers.
+// Each processor might have a different number.
+// Software must query CPUID(eax=10h, ecx=1h) to discover the number of available COS
+#define MAX_ARCH_L3_COS 16
+
 struct X86MachineState {
     /*< private >*/
     MachineState parent;
@@ -85,6 +90,11 @@ struct X86MachineState {
      * which means no limitation on the guest's bus locks.
      */
     uint64_t bus_lock_ratelimit;
+
+    /**
+     * Shared state between cores
+     */
+    uint64_t msr_ia32_l3_mask[MAX_ARCH_L3_COS];
 };
 
 #define X86_MACHINE_SMM              "smm"

@@ -1365,11 +1365,6 @@ typedef struct {
 // Software must query CPUID(eax=10h, ecx=2h) to discover the number of available COS
 #define MAX_ARCH_L2_COS 16
 
-// The following value is the architectural maximum supported COS numbers.
-// Each processor might have a different number.
-// Software must query CPUID(eax=10h, ecx=1h) to discover the number of available COS
-#define MAX_ARCH_L3_COS 16
-
 typedef union X86LegacyXSaveArea {
     struct {
         uint16_t fcw;
@@ -1652,7 +1647,6 @@ typedef struct CPUArchState {
     uint64_t msr_gp_evtsel[MAX_GP_COUNTERS];
 
     uint64_t msr_ia32_pqr_assoc;
-    uint64_t msr_ia32_l3_mask[MAX_ARCH_L3_COS];
     uint64_t msr_ia32_l2_mask[MAX_ARCH_L2_COS];
     uint64_t pat;
     uint32_t smbase;

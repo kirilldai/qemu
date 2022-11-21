@@ -2456,14 +2456,14 @@ static bool kvm_rdmsr_core_thread_count(X86CPU *cpu, uint32_t msr,
 static bool kvm_rdmsr_ia32_pqr_assoc(X86CPU *const cpu, const uint32_t msr,
                                      uint64_t *const val)
 {
-    CPUX86State *env = &cpu->env;
+    const CPUX86State *const env = &cpu->env;
     *val = env->msr_ia32_pqr_assoc;
     return true;
 }
 
 static bool kvm_wrmsr_ia32_pqr_assoc(X86CPU *const cpu, const uint32_t msr, const uint64_t val)
 {
-    CPUX86State *env = &cpu->env;
+    CPUX86State *const env = &cpu->env;
     env->msr_ia32_pqr_assoc = val;
     return true;
 }
@@ -2479,22 +2479,24 @@ static bool kvm_rdmsr_ia32_l2_mask(X86CPU *const cpu, const uint32_t msr,
 static bool kvm_wrmsr_ia32_l2_mask(X86CPU *const cpu, const uint32_t msr, const uint64_t val)
 {
     CPUX86State *env = &cpu->env;
-    env->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0] = val;
+    env->msr_ia32_l2_mask[msr - MSR_IA32_L2_MASK_0] = val;
     return true;
 }
 
 static bool kvm_rdmsr_ia32_l3_mask(X86CPU *const cpu, const uint32_t msr,
                                      uint64_t *const val)
 {
-    CPUX86State *env = &cpu->env;
-    *val = env->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0];
+    const MachineState *const ms = MACHINE(qdev_get_machine());
+    const X86MachineState *const x86ms = X86_MACHINE(ms);
+    *val = x86ms->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0];
     return true;
 }
 
 static bool kvm_wrmsr_ia32_l3_mask(X86CPU *const cpu, const uint32_t msr, const uint64_t val)
 {
-    CPUX86State *env = &cpu->env;
-    env->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0] = val;
+    MachineState *const ms = MACHINE(qdev_get_machine());
+    X86MachineState *const x86ms = X86_MACHINE(ms);
+    x86ms->msr_ia32_l3_mask[msr - MSR_IA32_L3_MASK_0] = val;
 
     return true;
 }
@@ -5300,6 +5302,14 @@ static bool kvm_filter_msr_range(KVMState *const s,
             }
 
             return true;
+        } else if ((msr == msr_handlers[i].msr) && (nmsrs == msr_handlers[i].nmsrs) &&
+                   (rdmsr == msr_handlers[i].rdmsr) && (wrmsr == msr_handlers[i].wrmsr)) {
+            // Already added
+            return true;
+        } else {
+            // Check for overlap
+            assert((msr >= (msr_handlers[i].msr + msr_handlers[i].nmsrs)) ||
+                   ((msr + nmsrs) <= msr_handlers[i].msr));
         }
     }
 
@@ -5326,6 +5336,14 @@ bool kvm_filter_msr(KVMState *s, uint32_t msr, QEMURDMSRHandler *rdmsr,
             }
 
             return true;
+        } else if ((msr == msr_handlers[i].msr) && (1 == msr_handlers[i].nmsrs) &&
+                   (rdmsr == msr_handlers[i].rdmsr) && (wrmsr == msr_handlers[i].wrmsr)) {
+            // Already added
+            return true;
+        } else {
+            // Check for overlap
+            assert((msr >= (msr_handlers[i].msr + msr_handlers[i].nmsrs)) ||
+                   (msr < msr_handlers[i].msr));
         }
     }
 
@@ -5339,9 +5357,10 @@ static int kvm_handle_rdmsr(X86CPU *cpu, struct kvm_run *run)
 
     for (i = 0; i < ARRAY_SIZE(msr_handlers); i++) {
         KVMMSRHandlers *handler = &msr_handlers[i];
-        if (run->msr.index == handler->msr) {
+        if ((run->msr.index >= handler->msr) &&
+            (run->msr.index <  (handler->msr + handler->nmsrs))) {
             if (handler->rdmsr) {
-                r = handler->rdmsr(cpu, handler->msr,
+                r = handler->rdmsr(cpu, run->msr.index,
                                    (uint64_t *)&run->msr.data);
                 run->msr.error = r ? 0 : 1;
                 return 0;
@@ -5362,7 +5381,7 @@ static int kvm_handle_wrmsr(X86CPU *cpu, struct kvm_run *run)
         if ((run->msr.index >= handler->msr) &&
             (run->msr.index <  (handler->msr + handler->nmsrs))) {
             if (handler->wrmsr) {
-                r = handler->wrmsr(cpu, handler->msr, run->msr.data);
+                r = handler->wrmsr(cpu, run->msr.index, run->msr.data);
                 run->msr.error = r ? 0 : 1;
                 return 0;
             }
