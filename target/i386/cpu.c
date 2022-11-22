@@ -2806,7 +2806,7 @@ static const X86CPUDefinition builtin_x86_defs[] = {
     },
     {
         .name = "Skylake-Client",
-        .level = 0xd,
+        .level = 0x1b,
         .vendor = CPUID_VENDOR_INTEL,
         .family = 6,
         .model = 94,
@@ -2823,7 +2823,7 @@ static const X86CPUDefinition builtin_x86_defs[] = {
             CPUID_EXT_SSE41 | CPUID_EXT_CX16 | CPUID_EXT_SSSE3 |
             CPUID_EXT_PCLMULQDQ | CPUID_EXT_SSE3 |
             CPUID_EXT_TSC_DEADLINE_TIMER | CPUID_EXT_FMA | CPUID_EXT_MOVBE |
-            CPUID_EXT_PCID | CPUID_EXT_F16C | CPUID_EXT_RDRAND,
+            CPUID_EXT_PCID | CPUID_EXT_F16C | CPUID_EXT_RDRAND | CPUID_EXT_VMX,
         .features[FEAT_8000_0001_EDX] =
             CPUID_EXT2_LM | CPUID_EXT2_RDTSCP | CPUID_EXT2_NX |
             CPUID_EXT2_SYSCALL,
