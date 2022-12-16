@@ -55,7 +55,7 @@ const size_t FPGA_DRAM_SIZE = 1024 * 1024 * 1024;
 const size_t FPGA_IQM_OFFSET = 0x44a20000; 
 
 /**
- * Length of FPGA's dedicated IQM.
+ * Size of IQM register bank.
  */
 const size_t FPGA_IQM_SIZE = 56;
 
