@@ -124,8 +124,6 @@ typedef struct XdmaBar {
     uint8_t padding5[0x2e00];
 } XdmaBar;
 
-#pragma pack()
-
 typedef struct Iqm {
     uint32_t control;
     uint32_t status;
@@ -141,6 +139,8 @@ typedef struct Iqm {
     uint32_t contrast2;
     uint32_t contrast2_msb;
 } Iqm;
+
+#pragma pack()
 
 typedef enum FwdFpgaXdmaEngineDirection {
     FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C,
@@ -238,21 +238,23 @@ static uint64_t translate_fpga_address_to_iqm_offset(uint64_t address, uint64_t 
     return address - FPGA_IQM_OFFSET;
 }
 
-static void iqm_mapper(FwdFpgaXdmaEngine* engine){
-    uint64_t input_offset = translate_fpga_address_to_dram_offset(engine->iqm->input_baseaddr, 0);
-    uint64_t mapped_offset = translate_fpga_address_to_dram_offset(engine->iqm->map_baseaddr, 0);
+static void iqm_mapper(Iqm *iqm, void *fpga_dram){
+    uint64_t input_offset = translate_fpga_address_to_dram_offset(iqm->input_baseaddr, 0);
+    uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
 
     uint64_t pixel_offset = 0x0000000;
     for(uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH; pixel_x++){
         for(uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT; pixel_y++){
-            short int pxl_value = 0;  
-            memcpy(&pxl_value, engine->fpga_dram + input_offset + pixel_offset, 2);
+            uint16_t pxl_value = 0;  
+            memcpy(&pxl_value, fpga_dram + input_offset + pixel_offset, sizeof(pxl_value));
 
             double pxl = pxl_value;
+            
+            // Formula can be found in IQM HDD.
             pxl = 16 * (2.0 * sqrt(pxl) / IQM_ALPHA  - (2 * log(IQM_ALPHA * sqrt(pxl) + 1)) / (IQM_ALPHA * IQM_ALPHA));
             pxl_value = floor(pxl);
 
-            memcpy(engine->fpga_dram + mapped_offset + pixel_offset, &pxl_value, 2);
+            memcpy(fpga_dram + mapped_offset + pixel_offset, &pxl_value, sizeof(pxl_value));
 
             pixel_offset += sizeof(short int);
         }   
@@ -261,13 +263,14 @@ static void iqm_mapper(FwdFpgaXdmaEngine* engine){
 
 static void iqm_brightness_and_contrast(Iqm *iqm, void *fpga_dram){
     uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
+    uint64_t addresses[] = {0, 0x2, 0x2000, 0x2002}; // Addresses of RGGB pixels in Bayer pattern
+
     uint64_t bright_r = 0, bright_g = 0, bright_b = 0, bright_rgb = 0,
             contrast1 = 0, contrast2 = 0;
 
     for(uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT/2; pixel_y++){
         for(uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH/2; pixel_x++){
             uint64_t baseaddress = 0x4000 * pixel_y + 0x4 * pixel_x;
-            uint64_t addresses[] = {0, 0x2, 0x2000, 0x2002}; // Addresses of RGGB pixels in Bayer pattern
 
             uint16_t pixel_val, mx_color = 0, gray = 0;
             uint16_t color_values[4];
@@ -282,7 +285,7 @@ static void iqm_brightness_and_contrast(Iqm *iqm, void *fpga_dram){
             bright_rgb += mx_color;
 
             bright_r += color_values[0];
-            bright_g += (color_values[1] + color_values[2]) / 2.0;
+            bright_g += color_values[1] + color_values[2];
             bright_b += color_values[3];
 
             contrast1 += gray;
@@ -290,8 +293,9 @@ static void iqm_brightness_and_contrast(Iqm *iqm, void *fpga_dram){
         }
     }
 
+    // Division by 8, so the results fit in a 32-bit register accroding to IQM ICD.
     iqm->bright_r = bright_r / 8.0;
-    iqm->bright_g = bright_g / 8.0;
+    iqm->bright_g = bright_g / 2.0 / 8.0;
     iqm->bright_b = bright_b / 8.0;
     iqm->bright_rgb = bright_rgb / 8.0;
 
@@ -308,7 +312,7 @@ static void iqm_brightness_and_contrast(Iqm *iqm, void *fpga_dram){
 static void execute_iqm(FwdFpgaXdmaEngine* engine){
     engine->iqm->status = 1;
 
-    iqm_mapper(engine);
+    iqm_mapper(engine->iqm, engine->fpga_dram);
     iqm_brightness_and_contrast(engine->iqm, engine->fpga_dram);
 
     engine->iqm->status = 0;
