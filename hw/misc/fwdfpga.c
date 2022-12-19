@@ -138,6 +138,12 @@ typedef struct Iqm {
     uint32_t contrast1_msb;
     uint32_t contrast2;
     uint32_t contrast2_msb;
+
+    QemuThread thread;
+    QemuMutex mutex;
+    QemuCond cv;
+
+    void *fpga_dram;
 } Iqm;
 
 #pragma pack()
@@ -238,7 +244,7 @@ static uint64_t translate_fpga_address_to_iqm_offset(uint64_t address, uint64_t 
     return address - FPGA_IQM_OFFSET;
 }
 
-static void iqm_mapper(Iqm *iqm, void *fpga_dram){
+static void iqm_mapper(Iqm *iqm){
     uint64_t input_offset = translate_fpga_address_to_dram_offset(iqm->input_baseaddr, 0);
     uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
 
@@ -246,7 +252,7 @@ static void iqm_mapper(Iqm *iqm, void *fpga_dram){
     for(uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH; pixel_x++){
         for(uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT; pixel_y++){
             uint16_t pxl_value = 0;  
-            memcpy(&pxl_value, fpga_dram + input_offset + pixel_offset, sizeof(pxl_value));
+            memcpy(&pxl_value, iqm->fpga_dram + input_offset + pixel_offset, sizeof(pxl_value));
 
             double pxl = pxl_value;
             
@@ -254,14 +260,14 @@ static void iqm_mapper(Iqm *iqm, void *fpga_dram){
             pxl = 16 * (2.0 * sqrt(pxl) / IQM_ALPHA  - (2 * log(IQM_ALPHA * sqrt(pxl) + 1)) / (IQM_ALPHA * IQM_ALPHA));
             pxl_value = floor(pxl);
 
-            memcpy(fpga_dram + mapped_offset + pixel_offset, &pxl_value, sizeof(pxl_value));
+            memcpy(iqm->fpga_dram + mapped_offset + pixel_offset, &pxl_value, sizeof(pxl_value));
 
             pixel_offset += sizeof(short int);
         }   
     }
 }
 
-static void iqm_brightness_and_contrast(Iqm *iqm, void *fpga_dram){
+static void iqm_brightness_and_contrast(Iqm *iqm){
     uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
     uint64_t addresses[] = {0, 0x2, 0x2000, 0x2002}; // Addresses of RGGB pixels in Bayer pattern
 
@@ -275,7 +281,7 @@ static void iqm_brightness_and_contrast(Iqm *iqm, void *fpga_dram){
             uint16_t pixel_val, mx_color = 0, gray = 0;
             uint16_t color_values[4];
             for(uint8_t pixel_idx = 0; pixel_idx < 4; pixel_idx++){
-                memcpy(&pixel_val, fpga_dram + mapped_offset + baseaddress + addresses[pixel_idx], sizeof(short int));
+                memcpy(&pixel_val, iqm->fpga_dram + mapped_offset + baseaddress + addresses[pixel_idx], sizeof(short int));
 
                 gray += pixel_val;
                 mx_color = fmax(mx_color, pixel_val);
@@ -309,31 +315,41 @@ static void iqm_brightness_and_contrast(Iqm *iqm, void *fpga_dram){
     iqm->contrast2_msb = contrast2 >> 32;
 }
 
-static void execute_iqm(FwdFpgaXdmaEngine* engine){
-    engine->iqm->status = 1;
+static void execute_iqm(Iqm* iqm){
+    iqm->status = 1;
 
-    iqm_mapper(engine->iqm, engine->fpga_dram);
-    iqm_brightness_and_contrast(engine->iqm, engine->fpga_dram);
-
-    engine->iqm->status = 0;
-    engine->iqm->control = 0;
+    iqm_mapper(iqm);
+    iqm_brightness_and_contrast(iqm);
 }
 
 static void* fwdfpga_iqm_thread(void* context){
-    FwdFpgaXdmaEngine* engine = (FwdFpgaXdmaEngine*)context;
+    Iqm* iqm = (Iqm*)context;
 
-    qemu_mutex_lock(&engine->mutex);
+    qemu_mutex_lock(&iqm->mutex);
     
-    execute_iqm(engine);
+    while (1) {
+        qemu_cond_wait(&iqm->cv, &iqm->mutex);
 
-    qemu_mutex_unlock(&engine->mutex);
+        qemu_mutex_unlock(&iqm->mutex);
+        execute_iqm(iqm);
+        qemu_mutex_lock(&iqm->mutex);
+
+        iqm->control = 0;
+        iqm->status = 0;
+    }
+
+    qemu_mutex_unlock(&iqm->mutex);
 
     return NULL;
 }
 
-static void check_status_iqm(FwdFpgaXdmaEngine* engine){
-    if(engine->iqm->control & 1 && engine->iqm->status == 0)        
-        qemu_thread_create(&engine->thread, "iqm", fwdfpga_iqm_thread, engine, QEMU_THREAD_DETACHED);
+static void check_status_iqm(Iqm *iqm, void* fpga_dram){
+    qemu_mutex_lock(&iqm->mutex);
+    if(iqm->control & 1 && iqm->status == 0){ 
+        iqm->fpga_dram = fpga_dram;
+        qemu_cond_signal(&iqm->cv);  
+    }
+    qemu_mutex_unlock(&iqm->mutex);
 }
 
 static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
@@ -357,7 +373,7 @@ static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, co
                 return false;
             }
 
-            check_status_iqm(engine);
+            check_status_iqm(engine->iqm, engine->fpga_dram);
         }
         else{
             qemu_mutex_lock(engine->bar_mutex);
@@ -459,6 +475,23 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
     qemu_mutex_init(&engine->mutex);
     qemu_cond_init(&engine->cv);
     qemu_thread_create(&engine->thread, "xdma", fwdfpga_xdma_engine_thread, engine, QEMU_THREAD_JOINABLE);
+}
+
+static void fwdfpga_iqm_init(Iqm *iqm){
+    qemu_mutex_init(&iqm->mutex);
+    qemu_cond_init(&iqm->cv);
+    qemu_thread_create(&iqm->thread, "iqm", fwdfpga_iqm_thread, iqm, QEMU_THREAD_JOINABLE);
+}
+
+static void fwdfpga_iqm_uninit(Iqm* iqm) {
+    qemu_mutex_lock(&iqm->mutex);
+    iqm->status = 0;
+    qemu_mutex_unlock(&iqm->mutex);
+    qemu_cond_signal(&iqm->cv);
+
+    qemu_thread_join(&iqm->thread);
+    qemu_cond_destroy(&iqm->cv);
+    qemu_mutex_destroy(&iqm->mutex);
 }
 
 static void fwdfpga_xdma_engine_uninit(FwdFpgaXdmaEngine* engine) {
@@ -617,6 +650,8 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
 
     fwdfpga->bar = bar;
 
+    fwdfpga_iqm_init(&fwdfpga->iqm);
+
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
     fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
@@ -635,6 +670,8 @@ static void pci_fwdfpga_uninit(PCIDevice *pdev)
     fwdfpga_xdma_engine_uninit(&fwdfpga->h2c_engines[1]);
     fwdfpga_xdma_engine_uninit(&fwdfpga->c2h_engines[0]);
     fwdfpga_xdma_engine_uninit(&fwdfpga->c2h_engines[1]);
+
+    fwdfpga_iqm_uninit(&fwdfpga->iqm);
 
     qemu_mutex_destroy(&fwdfpga->bar_mutex);
 
