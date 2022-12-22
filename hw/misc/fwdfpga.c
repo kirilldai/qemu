@@ -142,6 +142,7 @@ typedef struct Iqm {
     QemuThread thread;
     QemuMutex mutex;
     QemuCond cv;
+    bool shutdown;
 
     void *fpga_dram;
 } Iqm;
@@ -244,13 +245,13 @@ static uint64_t translate_fpga_address_to_iqm_offset(uint64_t address, uint64_t 
     return address - FPGA_IQM_OFFSET;
 }
 
-static void iqm_mapper(Iqm *iqm){
+static void iqm_mapper(Iqm *iqm) {
     uint64_t input_offset = translate_fpga_address_to_dram_offset(iqm->input_baseaddr, 0);
     uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
 
     uint64_t pixel_offset = 0x0000000;
-    for(uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH; pixel_x++){
-        for(uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT; pixel_y++){
+    for (uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH; pixel_x++) {
+        for (uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT; pixel_y++) {
             uint16_t pxl_value = 0;  
             memcpy(&pxl_value, iqm->fpga_dram + input_offset + pixel_offset, sizeof(pxl_value));
 
@@ -262,26 +263,26 @@ static void iqm_mapper(Iqm *iqm){
 
             memcpy(iqm->fpga_dram + mapped_offset + pixel_offset, &pxl_value, sizeof(pxl_value));
 
-            pixel_offset += sizeof(short int);
+            pixel_offset += sizeof(pxl_value);
         }   
     }
 }
 
-static void iqm_brightness_and_contrast(Iqm *iqm){
+static void iqm_brightness_and_contrast(Iqm *iqm) {
     uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
-    uint64_t addresses[] = {0, 0x2, 0x2000, 0x2002}; // Addresses of RGGB pixels in Bayer pattern
+    uint64_t bayer_offsets[] = {0, 0x2, 0x2000, 0x2002}; // Addresses of RGGB pixels in Bayer pattern
 
     uint64_t bright_r = 0, bright_g = 0, bright_b = 0, bright_rgb = 0,
             contrast1 = 0, contrast2 = 0;
 
-    for(uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT/2; pixel_y++){
-        for(uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH/2; pixel_x++){
+    for (uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT/2; pixel_y++) {
+        for (uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH/2; pixel_x++) {
             uint64_t baseaddress = 0x4000 * pixel_y + 0x4 * pixel_x;
 
             uint16_t pixel_val, mx_color = 0, gray = 0;
             uint16_t color_values[4];
-            for(uint8_t pixel_idx = 0; pixel_idx < 4; pixel_idx++){
-                memcpy(&pixel_val, iqm->fpga_dram + mapped_offset + baseaddress + addresses[pixel_idx], sizeof(short int));
+            for (uint8_t pixel_idx = 0; pixel_idx < 4; pixel_idx++) {
+                memcpy(&pixel_val, iqm->fpga_dram + mapped_offset + baseaddress + bayer_offsets[pixel_idx], sizeof(pixel_val));
 
                 gray += pixel_val;
                 mx_color = fmax(mx_color, pixel_val);
@@ -300,35 +301,38 @@ static void iqm_brightness_and_contrast(Iqm *iqm){
     }
 
     // Division by 8, so the results fit in a 32-bit register accroding to IQM ICD.
-    iqm->bright_r = bright_r / 8.0;
-    iqm->bright_g = bright_g / 2.0 / 8.0;
-    iqm->bright_b = bright_b / 8.0;
-    iqm->bright_rgb = bright_rgb / 8.0;
+    iqm->bright_r = bright_r / 8;
+    iqm->bright_g = bright_g / 2 / 8;
+    iqm->bright_b = bright_b / 8;
+    iqm->bright_rgb = bright_rgb / 8;
 
 
-    contrast1 /= 4.0,
+    contrast1 /= 4;
     iqm->contrast1 = (uint32_t)contrast1;
     iqm->contrast1_msb = contrast1 >> 32;
 
-    contrast2 /= 16.0;
+    contrast2 /= 16;
     iqm->contrast2 = (uint32_t)contrast2;
     iqm->contrast2_msb = contrast2 >> 32;
 }
 
-static void execute_iqm(Iqm* iqm){
-    iqm->status = 1;
-
+static void execute_iqm(Iqm* iqm) {
     iqm_mapper(iqm);
     iqm_brightness_and_contrast(iqm);
 }
 
-static void* fwdfpga_iqm_thread(void* context){
+static void* fwdfpga_iqm_thread(void* context) {
     Iqm* iqm = (Iqm*)context;
 
     qemu_mutex_lock(&iqm->mutex);
     
     while (1) {
         qemu_cond_wait(&iqm->cv, &iqm->mutex);
+        if (engine->shutdown) {
+            break;
+        }
+
+        iqm->status = 1;
 
         qemu_mutex_unlock(&iqm->mutex);
         execute_iqm(iqm);
@@ -343,12 +347,10 @@ static void* fwdfpga_iqm_thread(void* context){
     return NULL;
 }
 
-static void check_status_iqm(Iqm *iqm, void* fpga_dram){
+static void check_status_iqm(Iqm *iqm, void* fpga_dram) {
     qemu_mutex_lock(&iqm->mutex);
-    if(iqm->control & 1 && iqm->status == 0){ 
-        iqm->fpga_dram = fpga_dram;
+    if (iqm->control & 1 && iqm->status == 0)
         qemu_cond_signal(&iqm->cv);  
-    }
     qemu_mutex_unlock(&iqm->mutex);
 }
 
@@ -357,16 +359,15 @@ static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, co
         uint64_t dram_offset = translate_fpga_address_to_dram_offset(descriptor->dstAddress, descriptor->length);
         uint64_t iqm_offset = translate_fpga_address_to_iqm_offset(descriptor->dstAddress, descriptor->length);
 
-        if (dram_offset != ~0ULL){
-            if(pci_dma_read(engine->pdev, descriptor->srcAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
+        if (dram_offset != ~0ULL) {
+            if (pci_dma_read(engine->pdev, descriptor->srcAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
                 qemu_mutex_lock(engine->bar_mutex);
                 engine->channel->status |= 0x200; // read error
                 qemu_mutex_unlock(engine->bar_mutex);
                 return false;
             }
-        }
-        else if (iqm_offset != ~0ULL){
-            if(pci_dma_read(engine->pdev, descriptor->srcAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
+        } else if (iqm_offset != ~0ULL) {
+            if (pci_dma_read(engine->pdev, descriptor->srcAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
                 qemu_mutex_lock(engine->bar_mutex);
                 engine->channel->status |= 0x200; // read error
                 qemu_mutex_unlock(engine->bar_mutex);
@@ -374,8 +375,7 @@ static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, co
             }
 
             check_status_iqm(engine->iqm, engine->fpga_dram);
-        }
-        else{
+        } else {
             qemu_mutex_lock(engine->bar_mutex);
             engine->channel->status |= 0x200; // read error
             qemu_mutex_unlock(engine->bar_mutex);
@@ -385,23 +385,21 @@ static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, co
         uint64_t dram_offset = translate_fpga_address_to_dram_offset(descriptor->srcAddress, descriptor->length);
         uint64_t iqm_offset = translate_fpga_address_to_iqm_offset(descriptor->srcAddress, descriptor->length);
         
-        if (dram_offset != ~0ULL){
-            if(pci_dma_write(engine->pdev, descriptor->dstAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
+        if (dram_offset != ~0ULL) {
+            if (pci_dma_write(engine->pdev, descriptor->dstAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
                 qemu_mutex_lock(engine->bar_mutex);
                 engine->channel->status |= 0x4000; // write error
                 qemu_mutex_unlock(engine->bar_mutex);
                 return false;
             }
-        }
-        else if (iqm_offset != ~0ULL){
-            if(pci_dma_write(engine->pdev, descriptor->dstAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
+        } else if (iqm_offset != ~0ULL) {
+            if (pci_dma_write(engine->pdev, descriptor->dstAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
                 qemu_mutex_lock(engine->bar_mutex);
                 engine->channel->status |= 0x4000; // write error
                 qemu_mutex_unlock(engine->bar_mutex);
                 return false;
             }
-        }
-        else{
+        } else {
             qemu_mutex_lock(engine->bar_mutex);
             engine->channel->status |= 0x4000; // write error
             qemu_mutex_unlock(engine->bar_mutex);
@@ -477,7 +475,7 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
     qemu_thread_create(&engine->thread, "xdma", fwdfpga_xdma_engine_thread, engine, QEMU_THREAD_JOINABLE);
 }
 
-static void fwdfpga_iqm_init(Iqm *iqm){
+static void fwdfpga_iqm_init(Iqm *iqm) {
     qemu_mutex_init(&iqm->mutex);
     qemu_cond_init(&iqm->cv);
     qemu_thread_create(&iqm->thread, "iqm", fwdfpga_iqm_thread, iqm, QEMU_THREAD_JOINABLE);
@@ -485,7 +483,7 @@ static void fwdfpga_iqm_init(Iqm *iqm){
 
 static void fwdfpga_iqm_uninit(Iqm* iqm) {
     qemu_mutex_lock(&iqm->mutex);
-    iqm->status = 0;
+    iqm->shutdown = true;
     qemu_mutex_unlock(&iqm->mutex);
     qemu_cond_signal(&iqm->cv);
 
@@ -651,6 +649,7 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
     fwdfpga->bar = bar;
 
     fwdfpga_iqm_init(&fwdfpga->iqm);
+    fwdfpga->iqm.fpga_dram = fwdfpga->fpga_dram;
 
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
