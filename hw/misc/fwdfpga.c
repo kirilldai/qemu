@@ -328,7 +328,7 @@ static void* fwdfpga_iqm_thread(void* context) {
     
     while (1) {
         qemu_cond_wait(&iqm->cv, &iqm->mutex);
-        if (engine->shutdown) {
+        if (iqm->shutdown) {
             break;
         }
 
