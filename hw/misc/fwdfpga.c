@@ -284,8 +284,9 @@ static void iqm_brightness_and_contrast(Iqm *iqm) {
             for (uint8_t pixel_idx = 0; pixel_idx < 4; pixel_idx++) {
                 memcpy(&pixel_val, iqm->fpga_dram + mapped_offset + baseaddress + bayer_offsets[pixel_idx], sizeof(pixel_val));
 
+                if (pixel_val > mx_color)
+                    mx_color = pixel_val;
                 gray += pixel_val;
-                mx_color = fmax(mx_color, pixel_val);
                 color_values[pixel_idx] = pixel_val;
             }
     
@@ -475,7 +476,9 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
     qemu_thread_create(&engine->thread, "xdma", fwdfpga_xdma_engine_thread, engine, QEMU_THREAD_JOINABLE);
 }
 
-static void fwdfpga_iqm_init(Iqm *iqm) {
+static void fwdfpga_iqm_init(Iqm *iqm, void* fpga_dram) {
+    iqm->fpga_dram = fpga_dram;
+
     qemu_mutex_init(&iqm->mutex);
     qemu_cond_init(&iqm->cv);
     qemu_thread_create(&iqm->thread, "iqm", fwdfpga_iqm_thread, iqm, QEMU_THREAD_JOINABLE);
@@ -648,8 +651,7 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
 
     fwdfpga->bar = bar;
 
-    fwdfpga_iqm_init(&fwdfpga->iqm);
-    fwdfpga->iqm.fpga_dram = fwdfpga->fpga_dram;
+    fwdfpga_iqm_init(&fwdfpga->iqm, fwdfpga->fpga_dram);
 
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
