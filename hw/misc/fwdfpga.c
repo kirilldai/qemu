@@ -36,6 +36,8 @@
 
 #define TYPE_PCI_FWD_FPGA_DEVICE "fwdfpga"
 
+#define FPGA_DEVICES_NUMBER 3
+
 typedef struct FwdFpgaState FwdFpgaState;
 DECLARE_INSTANCE_CHECKER(FwdFpgaState, FWD_FPGA, TYPE_PCI_FWD_FPGA_DEVICE)
 
@@ -58,6 +60,17 @@ const size_t FPGA_IQM_OFFSET = 0x44a20000;
  * Size of IQM register bank.
  */
 const size_t FPGA_IQM_SIZE = 56;
+
+/**
+ * Offset of IPP in FPGA address space.
+*/
+const size_t FPGA_IPP_OFFSET = 0x44a10000; 
+
+/**
+ * Size of IPP register bank.
+ */
+const size_t FPGA_IPP_SIZE = 48;
+
 
 /**
  * Constants for IQM calculations from IQM HDD.
@@ -147,6 +160,35 @@ typedef struct Iqm {
     void *fpga_dram;
 } Iqm;
 
+typedef struct Ipp{
+    uint32_t control;
+    uint32_t status;
+    uint32_t error;
+    uint32_t offset;
+    uint32_t scale;
+    uint32_t input_baseaddr;
+    uint32_t input_baseaddr_msb;
+    uint32_t norm_baseaddr;
+    uint32_t norm_baseaddr_msb;
+    uint32_t tile_baseaddr;
+    uint32_t tile_baseaddr_msb;
+    uint32_t reversed;
+
+    QemuThread thread;
+    QemuMutex mutex;
+    QemuCond cv;
+    bool shutdown;
+
+    void *fpga_dram;
+} Ipp;
+
+typedef struct Device {
+    uint64_t offset;
+    uint64_t size;
+
+    void *device;
+} Device;
+
 #pragma pack()
 
 typedef enum FwdFpgaXdmaEngineDirection {
@@ -162,6 +204,9 @@ typedef struct FwdFpgaXdmaEngine {
     QemuMutex* bar_mutex;
     void* fpga_dram;
     Iqm* iqm;
+    Ipp* ipp;
+
+    Device* devices;
 
     QemuThread thread;
     QemuMutex mutex;
@@ -177,13 +222,17 @@ struct FwdFpgaState {
     QemuMutex bar_mutex;
     XdmaBar bar;
     void* fpga_dram;
-    Iqm iqm;
+
+    Device devices[FPGA_DEVICES_NUMBER];
 
     uint8_t xdma_bar_id;
     uint32_t xdma_bar_size;
 
     FwdFpgaXdmaEngine h2c_engines[2];
     FwdFpgaXdmaEngine c2h_engines[2];
+
+    Iqm* iqm;
+    Ipp* ipp;
 };
 
 static GArray* fwdfpga_xdma_engine_fetch_descriptors(FwdFpgaXdmaEngine* engine) {
@@ -236,13 +285,13 @@ static uint64_t translate_fpga_address_to_dram_offset(uint64_t address, uint64_t
     return address - FPGA_DRAM_OFFSET;
 }
 
-static uint64_t translate_fpga_address_to_iqm_offset(uint64_t address, uint64_t length) {   
-    if (address < FPGA_IQM_OFFSET ||
-        address + length > FPGA_IQM_OFFSET + FPGA_IQM_SIZE) {
+static uint64_t translate_fpga_address_to_device_offset(Device *dev, uint64_t address, uint64_t length){
+    if (address < dev->offset ||
+        address + length > dev->offset + dev->size) {
         return ~0ULL;
     }
 
-    return address - FPGA_IQM_OFFSET;
+    return address - dev->offset;
 }
 
 static void iqm_mapper(Iqm *iqm) {
@@ -351,64 +400,93 @@ static void* fwdfpga_iqm_thread(void* context) {
 static void check_status_iqm(Iqm *iqm, void* fpga_dram) {
     qemu_mutex_lock(&iqm->mutex);
     if (iqm->control & 1 && iqm->status == 0)
-        qemu_cond_signal(&iqm->cv);  
+        qemu_cond_signal(&iqm->cv);
     qemu_mutex_unlock(&iqm->mutex);
 }
 
-static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
-    if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) {
-        uint64_t dram_offset = translate_fpga_address_to_dram_offset(descriptor->dstAddress, descriptor->length);
-        uint64_t iqm_offset = translate_fpga_address_to_iqm_offset(descriptor->dstAddress, descriptor->length);
+static void execute_ipp(Ipp* ipp) {
+    // double scale = (double)ipp->scale / (double)(1 << 12);
+    
+}
 
-        if (dram_offset != ~0ULL) {
-            if (pci_dma_read(engine->pdev, descriptor->srcAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x200; // read error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
-            }
-        } else if (iqm_offset != ~0ULL) {
-            if (pci_dma_read(engine->pdev, descriptor->srcAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x200; // read error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
-            }
+static void* fwdfpga_ipp_thread(void* context) {
+    Ipp* ipp = (Ipp*)context;
 
-            check_status_iqm(engine->iqm, engine->fpga_dram);
-        } else {
-            qemu_mutex_lock(engine->bar_mutex);
-            engine->channel->status |= 0x200; // read error
-            qemu_mutex_unlock(engine->bar_mutex);
-            return false;
+    qemu_mutex_lock(&ipp->mutex);
+    
+    while (1) {
+        qemu_cond_wait(&ipp->cv, &ipp->mutex);
+
+        if (ipp->shutdown) {
+            break;
         }
-    } else {
-        uint64_t dram_offset = translate_fpga_address_to_dram_offset(descriptor->srcAddress, descriptor->length);
-        uint64_t iqm_offset = translate_fpga_address_to_iqm_offset(descriptor->srcAddress, descriptor->length);
+
+        ipp->status = 1; 
         
-        if (dram_offset != ~0ULL) {
-            if (pci_dma_write(engine->pdev, descriptor->dstAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x4000; // write error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
+        qemu_mutex_unlock(&ipp->mutex);
+        execute_ipp(ipp);
+        qemu_mutex_lock(&ipp->mutex);
+
+        ipp->control = 0;
+        ipp->status = 0;
+    }
+
+    qemu_mutex_unlock(&ipp->mutex);
+
+    return NULL;
+}
+
+static void check_status_ipp(Ipp *ipp, void* fpga_dram) {
+    qemu_mutex_lock(&ipp->mutex);
+    if (ipp->control & 1 && ipp->status == 0)
+        qemu_cond_signal(&ipp->cv);
+    qemu_mutex_unlock(&ipp->mutex);
+}
+
+static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
+    for(uint8_t idx = 0; idx < FPGA_DEVICES_NUMBER; idx++){
+        if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) {
+            uint64_t device_offset = translate_fpga_address_to_device_offset(&engine->devices[idx], descriptor->dstAddress, descriptor->length);
+
+            if (device_offset != ~0ULL){
+                if(pci_dma_read(engine->pdev, descriptor->srcAddress, engine->devices[idx].device + device_offset, descriptor->length) != MEMTX_OK) {
+                    qemu_mutex_lock(engine->bar_mutex);
+                    engine->channel->status |= 0x200; // read error
+                    qemu_mutex_unlock(engine->bar_mutex);
+                    return false;
+                }
+
+                check_status_iqm(engine->iqm, engine->fpga_dram);
+                check_status_ipp(engine->ipp, engine->fpga_dram);
+
+                return true;
             }
-        } else if (iqm_offset != ~0ULL) {
-            if (pci_dma_write(engine->pdev, descriptor->dstAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x4000; // write error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
+        } 
+        else {
+            uint64_t device_offset = translate_fpga_address_to_device_offset(&engine->devices[idx], descriptor->srcAddress, descriptor->length);
+
+            if (device_offset != ~0ULL){
+                if(pci_dma_write(engine->pdev, descriptor->dstAddress, engine->devices[idx].device + device_offset, descriptor->length) != MEMTX_OK) {
+                    qemu_mutex_lock(engine->bar_mutex);
+                    engine->channel->status |= 0x4000; // write error
+                    qemu_mutex_unlock(engine->bar_mutex);
+                    return false;
+                }
+
+                return true;
             }
-        } else {
-            qemu_mutex_lock(engine->bar_mutex);
-            engine->channel->status |= 0x4000; // write error
-            qemu_mutex_unlock(engine->bar_mutex);
-            return false;
         }
     }
 
-    return true;
+    // If the descriptor address doesn't match any device, set an error status.
+    qemu_mutex_lock(engine->bar_mutex);
+    if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) 
+        engine->channel->status |= 0x200; // read error
+    else
+        engine->channel->status |= 0x4000; // write error
+    qemu_mutex_unlock(engine->bar_mutex);
+
+    return false;
 }
 
 static void fwdfpga_xdma_engine_run(FwdFpgaXdmaEngine* engine) {
@@ -460,7 +538,7 @@ static void* fwdfpga_xdma_engine_thread(void* context) {
     return NULL;
 }
 
-static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngineDirection direction, PCIDevice* pdev, QemuMutex* bar_mutex, void *fpga_dram, Iqm *iqm, XdmaChannel* channel, XdmaSgdma* sgdma) {
+static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngineDirection direction, PCIDevice* pdev, QemuMutex* bar_mutex, void *fpga_dram, Iqm *iqm, Ipp *ipp, Device *devices, XdmaChannel* channel, XdmaSgdma* sgdma) {
     engine->direction = direction;
     engine->pdev = pdev;
     engine->channel = channel;
@@ -468,6 +546,8 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
     engine->bar_mutex = bar_mutex;
     engine->fpga_dram = fpga_dram;
     engine->iqm = iqm;
+    engine->ipp = ipp;
+    engine->devices = devices;
     engine->running = false;
     engine->shutdown = false;
 
@@ -477,6 +557,8 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
 }
 
 static void fwdfpga_iqm_init(Iqm *iqm, void* fpga_dram) {
+    memset(iqm, 0, sizeof(*iqm));
+
     iqm->fpga_dram = fpga_dram;
 
     qemu_mutex_init(&iqm->mutex);
@@ -493,6 +575,27 @@ static void fwdfpga_iqm_uninit(Iqm* iqm) {
     qemu_thread_join(&iqm->thread);
     qemu_cond_destroy(&iqm->cv);
     qemu_mutex_destroy(&iqm->mutex);
+}
+
+static void fwdfpga_ipp_init(Ipp *ipp, void* fpga_dram) {
+    memset(ipp, 0, sizeof(*ipp));
+    
+    ipp->fpga_dram = fpga_dram;
+
+    qemu_mutex_init(&ipp->mutex);
+    qemu_cond_init(&ipp->cv);
+    qemu_thread_create(&ipp->thread, "ipp", fwdfpga_ipp_thread, ipp, QEMU_THREAD_JOINABLE);
+}
+
+static void fwdfpga_ipp_uninit(Ipp* ipp) {
+    qemu_mutex_lock(&ipp->mutex);
+    ipp->shutdown = true;
+    qemu_mutex_unlock(&ipp->mutex);
+    qemu_cond_signal(&ipp->cv);
+
+    qemu_thread_join(&ipp->thread);
+    qemu_cond_destroy(&ipp->cv);
+    qemu_mutex_destroy(&ipp->mutex);
 }
 
 static void fwdfpga_xdma_engine_uninit(FwdFpgaXdmaEngine* engine) {
@@ -651,12 +754,34 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
 
     fwdfpga->bar = bar;
 
-    fwdfpga_iqm_init(&fwdfpga->iqm, fwdfpga->fpga_dram);
+    fwdfpga->iqm = g_malloc(sizeof(Iqm));
+    fwdfpga_iqm_init(fwdfpga->iqm, fwdfpga->fpga_dram);
+    
+    fwdfpga->ipp = g_malloc(sizeof(Ipp));
+    fwdfpga_ipp_init(fwdfpga->ipp, fwdfpga->fpga_dram);
 
-    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
-    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
-    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
-    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.c2hChannel1, &fwdfpga->bar.c2hSgdma1);
+    fwdfpga->devices[0] = (struct Device){
+        .offset = FPGA_DRAM_OFFSET,
+        .size = FPGA_DRAM_SIZE,
+        .device = fwdfpga->fpga_dram
+    };
+
+    fwdfpga->devices[1] = (struct Device){
+        .offset = FPGA_IQM_OFFSET,
+        .size = FPGA_IQM_SIZE,
+        .device = fwdfpga->iqm
+    };
+    
+    fwdfpga->devices[2] = (struct Device){
+        .offset = FPGA_IPP_OFFSET,
+        .size = FPGA_IPP_SIZE,
+        .device = fwdfpga->ipp
+    };
+
+    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
+    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
+    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
+    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.c2hChannel1, &fwdfpga->bar.c2hSgdma1);
 
     memory_region_init_io(&fwdfpga->mmio, OBJECT(fwdfpga), &fwdfpga_mmio_ops, fwdfpga,
             "fwdfpga-mmio", fwdfpga->xdma_bar_size);
@@ -672,7 +797,10 @@ static void pci_fwdfpga_uninit(PCIDevice *pdev)
     fwdfpga_xdma_engine_uninit(&fwdfpga->c2h_engines[0]);
     fwdfpga_xdma_engine_uninit(&fwdfpga->c2h_engines[1]);
 
-    fwdfpga_iqm_uninit(&fwdfpga->iqm);
+    fwdfpga_iqm_uninit(fwdfpga->iqm);
+    fwdfpga_ipp_uninit(fwdfpga->ipp);
+    g_free(fwdfpga->iqm);
+    g_free(fwdfpga->ipp);
 
     qemu_mutex_destroy(&fwdfpga->bar_mutex);
 
