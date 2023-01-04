@@ -76,9 +76,9 @@ const size_t FPGA_IPP_SIZE = 48;
  * Constants for IQM calculations from IQM HDD.
 */
 // Width in pixels of the Camera and Mapped Image.
-const uint16_t IQM_IMAGE_WIDTH = 4096;
+const uint16_t IMAGE_WIDTH = 4096;
 // Height in pixels of the Camera and Mapped Image.
-const uint16_t IQM_IMAGE_HEIGHT = 3000;
+const uint16_t IMAGE_HEIGHT = 3000;
 
 // IQM_ALPHA is used for Mapper function.
 const double IQM_ALPHA = 0.4400607;
@@ -299,8 +299,8 @@ static void iqm_mapper(Iqm *iqm) {
     uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
 
     uint64_t pixel_offset = 0x0000000;
-    for (uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH; pixel_x++) {
-        for (uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT; pixel_y++) {
+    for (uint16_t pixel_x = 0; pixel_x < IMAGE_WIDTH; pixel_x++) {
+        for (uint16_t pixel_y = 0; pixel_y < IMAGE_HEIGHT; pixel_y++) {
             uint16_t pxl_value = 0;  
             memcpy(&pxl_value, iqm->fpga_dram + input_offset + pixel_offset, sizeof(pxl_value));
 
@@ -324,8 +324,8 @@ static void iqm_brightness_and_contrast(Iqm *iqm) {
     uint64_t bright_r = 0, bright_g = 0, bright_b = 0, bright_rgb = 0,
             contrast1 = 0, contrast2 = 0;
 
-    for (uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT/2; pixel_y++) {
-        for (uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH/2; pixel_x++) {
+    for (uint16_t pixel_y = 0; pixel_y < IMAGE_HEIGHT/2; pixel_y++) {
+        for (uint16_t pixel_x = 0; pixel_x < IMAGE_WIDTH/2; pixel_x++) {
             uint64_t baseaddress = 0x4000 * pixel_y + 0x4 * pixel_x;
 
             uint16_t pixel_val, mx_color = 0, gray = 0;
@@ -404,9 +404,127 @@ static void check_status_iqm(Iqm *iqm, void* fpga_dram) {
     qemu_mutex_unlock(&iqm->mutex);
 }
 
-static void execute_ipp(Ipp* ipp) {
-    // double scale = (double)ipp->scale / (double)(1 << 12);
+static uint8_t tile_pos(int16_t (*indices)[2], uint16_t image_size, uint16_t tile_size, uint16_t px_pos, uint16_t decimation){
+    uint8_t nr_tiles = ceil((image_size / decimation) * 1.0 / tile_size);
+
+    // Precalculated offsets for tiling algorithm from IPP HDD.
+    int16_t offsets_width[] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t offsets_height[] = {0, -9, -18};
+
+	uint16_t tiled_px_pos = px_pos / decimation,
+    		 index = tiled_px_pos / tile_size;
+
+    uint8_t indices_idx = 0;
+    while (index < nr_tiles){
+        int16_t offset = 0;
+        if(image_size == 4096)
+            offset = offsets_width[index];
+        else if(image_size == 1500)
+            offset = offsets_height[index];
+
+        int16_t tile_index = (tiled_px_pos - offset) / tile_size,
+        		px_index = tiled_px_pos - (index * tile_size + offset);
+
+        index++;
+
+        if (px_index < 0 || px_index >= tile_size)
+            continue;
+
+        indices[indices_idx][0] = tile_index;
+        indices[indices_idx][1] = px_index;
+        indices_idx++;
+    }
+
+	return indices_idx;
+}
+
+static uint8_t tile_xy(uint16_t (*tiles)[4], uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t px_x, uint16_t px_y, uint16_t decimation){
+	uint8_t tile_x_len = ceil(1.0 * image_width / decimation / tile_size),
+		tile_y_len = ceil(1.0 * image_height / decimation / tile_size);
+
+	int16_t tile_x[tile_x_len][2];
+	tile_x_len = tile_pos(tile_x, image_width, tile_size, px_x, decimation);
+
+	int16_t tile_y[tile_y_len][2];
+	tile_y_len = tile_pos(tile_y, image_height, tile_size, px_y, decimation);
+
+	uint8_t tiles_idx = 0;
+	for(uint8_t i = 0; i < tile_x_len; i++)
+		for(uint8_t j = 0; j < tile_y_len; j++){
+			tiles[tiles_idx][0] = tile_x[i][0];
+			tiles[tiles_idx][1] = tile_y[j][0];
+			tiles[tiles_idx][2] = tile_x[i][1];
+			tiles[tiles_idx][3] = tile_y[j][1];
+
+			tiles_idx++;
+		}
+
+	return tiles_idx;
+}
+
+static uint8_t tile_addresses(uint32_t *addresses, uint16_t px_x, uint16_t px_y, uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t decimation, uint16_t batch_size, uint16_t block_size){
+	uint16_t tiled_image_width = image_width / decimation;
+    uint8_t nr_tiles = ceil(1.0 * tiled_image_width / tile_size);
+    uint16_t pixel_batch_size_bytes = block_size * batch_size;
+    uint32_t tile_batch_size_bytes = tile_size * tile_size * pixel_batch_size_bytes;
+
+    uint16_t tiles[2][4];
+    uint8_t tiles_sz = tile_xy(tiles, image_width, image_height, tile_size, px_x, px_y, decimation);
+
+    uint8_t block_index = 2 * (px_y % 2) + (px_x % 2);
+    uint8_t addresses_idx = 0;
+    for(uint8_t idx = 0; idx < tiles_sz; idx++){
+    	uint16_t tx = tiles[idx][0],
+	    		ty = tiles[idx][1],
+	    		px = tiles[idx][2],
+	    		py = tiles[idx][3];
+
+    	uint16_t global_tile = tx + nr_tiles * ty,
+        		 batch_tile = global_tile % batch_size,
+        		 batch = global_tile / batch_size;
+        uint32_t address = batch * tile_batch_size_bytes + (py * tile_size + px) * pixel_batch_size_bytes + batch_tile * block_size + block_index;
     
+        addresses[addresses_idx++] = address;
+    }
+
+    return addresses_idx;
+}
+
+static void execute_ipp(Ipp* ipp) {
+    double scale = (double)ipp->scale / (double)(1 << 12);
+
+    uint64_t input_baseaddr = (((uint64_t)ipp->input_baseaddr_msb) << 32) | ((uint64_t)ipp->input_baseaddr);
+    uint64_t input_offset = translate_fpga_address_to_dram_offset(input_baseaddr, 0);
+
+    uint64_t norm_baseaddr = (((uint64_t)ipp->norm_baseaddr_msb) << 32) | ((uint64_t)ipp->norm_baseaddr);
+    uint64_t norm_offset = translate_fpga_address_to_dram_offset(norm_baseaddr, 0);
+
+    uint64_t tile_baseaddr = (((uint64_t)ipp->norm_baseaddr_msb) << 32) | ((uint64_t)ipp->tile_baseaddr);
+    uint64_t tile_offset = translate_fpga_address_to_dram_offset(tile_baseaddr, 0);
+
+    uint64_t input_pixel_offset = 0x0000000,
+            norm_pixel_offset = 0x0000000;
+    for (uint16_t pixel_y = 0; pixel_y < IMAGE_HEIGHT/2; pixel_y++) {
+        for (uint16_t pixel_x = 0; pixel_x < IMAGE_WIDTH; pixel_x++) {
+            uint16_t pxl_value = 0;  
+            memcpy(&pxl_value, ipp->fpga_dram + input_offset + input_pixel_offset, sizeof(pxl_value));
+
+            // Formula can be found in IPP HDD
+            pxl_value = floor((scale * pxl_value + ipp->offset) / 16.0 + 0.5);
+
+            uint8_t norm_pxl_value = pxl_value;            
+            memcpy(ipp->fpga_dram + norm_offset + norm_pixel_offset, &norm_pxl_value, sizeof(norm_pxl_value));
+
+            uint32_t addresses[2];
+    	    uint8_t addresses_size = tile_addresses(addresses, pixel_x, pixel_y, IMAGE_WIDTH, IMAGE_HEIGHT/2, 256, 2, 12, 16);
+
+            for(uint8_t idx = 0; idx < addresses_size; idx++)
+                memcpy(ipp->fpga_dram + tile_offset + addresses[idx], &norm_pxl_value, sizeof(norm_pxl_value));
+
+            input_pixel_offset += sizeof(pxl_value);
+            norm_pixel_offset += sizeof(norm_pxl_value);
+        }   
+    }
 }
 
 static void* fwdfpga_ipp_thread(void* context) {
