@@ -224,7 +224,6 @@ struct FwdFpgaState {
     QemuMutex bar_mutex;
     XdmaBar bar;
     void* fpga_dram;
-    Iqm iqm;
 
     Device devices[FPGA_DEVICES_NUMBER];
 
