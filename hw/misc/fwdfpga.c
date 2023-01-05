@@ -187,6 +187,8 @@ typedef struct Device {
     uint64_t size;
 
     void *device;
+
+    void (*check_status)(void *device);
 } Device;
 
 #pragma pack()
@@ -397,7 +399,9 @@ static void* fwdfpga_iqm_thread(void* context) {
     return NULL;
 }
 
-static void check_status_iqm(Iqm *iqm, void* fpga_dram) {
+static void check_status_iqm(void *device) {
+    Iqm* iqm = (Iqm*)device;
+
     qemu_mutex_lock(&iqm->mutex);
     if (iqm->control & 1 && iqm->status == 0)
         qemu_cond_signal(&iqm->cv);
@@ -554,7 +558,9 @@ static void* fwdfpga_ipp_thread(void* context) {
     return NULL;
 }
 
-static void check_status_ipp(Ipp *ipp, void* fpga_dram) {
+static void check_status_ipp(void *device) {
+    Ipp* ipp = (Ipp*)device;
+
     qemu_mutex_lock(&ipp->mutex);
     if (ipp->control & 1 && ipp->status == 0)
         qemu_cond_signal(&ipp->cv);
@@ -574,8 +580,8 @@ static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, co
                     return false;
                 }
 
-                check_status_iqm(engine->iqm, engine->fpga_dram);
-                check_status_ipp(engine->ipp, engine->fpga_dram);
+                if (engine->devices[idx].check_status != NULL)
+                    engine->devices[idx].check_status(engine->devices[idx].device);
 
                 return true;
             }
@@ -880,19 +886,22 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
     fwdfpga->devices[0] = (struct Device) {
         .offset = FPGA_DRAM_OFFSET,
         .size = FPGA_DRAM_SIZE,
-        .device = fwdfpga->fpga_dram
+        .device = fwdfpga->fpga_dram,
+        .check_status = NULL
     };
 
     fwdfpga->devices[1] = (struct Device) {
         .offset = FPGA_IQM_OFFSET,
         .size = FPGA_IQM_SIZE,
-        .device = fwdfpga->iqm
+        .device = fwdfpga->iqm,
+        .check_status = check_status_iqm
     };
     
     fwdfpga->devices[2] = (struct Device) {
         .offset = FPGA_IPP_OFFSET,
         .size = FPGA_IPP_SIZE,
-        .device = fwdfpga->ipp
+        .device = fwdfpga->ipp,
+        .check_status = check_status_ipp
     };
 
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
