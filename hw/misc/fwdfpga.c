@@ -224,6 +224,7 @@ struct FwdFpgaState {
     QemuMutex bar_mutex;
     XdmaBar bar;
     void* fpga_dram;
+    Iqm iqm;
 
     Device devices[FPGA_DEVICES_NUMBER];
 
@@ -671,6 +672,7 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
     engine->iqm = iqm;
     engine->ipp = ipp;
     engine->devices = devices;
+
     engine->running = false;
     engine->shutdown = false;
 
@@ -927,6 +929,7 @@ static void pci_fwdfpga_uninit(PCIDevice *pdev)
     fwdfpga_ipp_uninit(fwdfpga->ipp);
     g_free(fwdfpga->iqm);
     g_free(fwdfpga->ipp);
+
 
     qemu_mutex_destroy(&fwdfpga->bar_mutex);
 
