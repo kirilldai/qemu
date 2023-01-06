@@ -36,7 +36,7 @@
 
 #define TYPE_PCI_FWD_FPGA_DEVICE "fwdfpga"
 
-#define FPGA_DEVICES_NUMBER 3
+#define NUM_FPGA_DEVICES 3
 
 typedef struct FwdFpgaState FwdFpgaState;
 DECLARE_INSTANCE_CHECKER(FwdFpgaState, FWD_FPGA, TYPE_PCI_FWD_FPGA_DEVICE)
@@ -230,7 +230,7 @@ struct FwdFpgaState {
     XdmaBar bar;
     void* fpga_dram;
 
-    Device devices[FPGA_DEVICES_NUMBER];
+    Device devices[NUM_FPGA_DEVICES];
 
     uint8_t xdma_bar_id;
     uint32_t xdma_bar_size;
@@ -522,9 +522,8 @@ static void execute_ipp(Ipp* ipp) {
             memcpy(&pxl_value, ipp->fpga_dram + input_offset + input_pixel_offset, sizeof(pxl_value));
 
             // Formula can be found in IPP HDD
-            pxl_value = (((pxl_value * ipp->scale) >> 12) + ipp->offset + 8) >> 4;
+            uint8_t norm_pxl_value = (((pxl_value * ipp->scale) >> 12) + ipp->offset + 8) >> 4;
 
-            uint8_t norm_pxl_value = pxl_value;            
             memcpy(ipp->fpga_dram + norm_offset + norm_pixel_offset, &norm_pxl_value, sizeof(norm_pxl_value));
 
             uint32_t addresses[2];
@@ -576,7 +575,7 @@ static void check_status_ipp(void *device) {
 }
 
 static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
-    for (uint8_t idx = 0; idx < FPGA_DEVICES_NUMBER; idx++) {
+    for (uint8_t idx = 0; idx < NUM_FPGA_DEVICES; idx++) {
         if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) {
             uint64_t device_offset = translate_fpga_address_to_device_offset(&engine->devices[idx], descriptor->dstAddress, descriptor->length);
 
@@ -669,15 +668,13 @@ static void* fwdfpga_xdma_engine_thread(void* context) {
     return NULL;
 }
 
-static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngineDirection direction, PCIDevice* pdev, QemuMutex* bar_mutex, void *fpga_dram, Iqm *iqm, Ipp *ipp, Device *devices, XdmaChannel* channel, XdmaSgdma* sgdma) {
+static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngineDirection direction, PCIDevice* pdev, QemuMutex* bar_mutex, void *fpga_dram, Device *devices, XdmaChannel* channel, XdmaSgdma* sgdma) {
     engine->direction = direction;
     engine->pdev = pdev;
     engine->channel = channel;
     engine->sgdma = sgdma;
     engine->bar_mutex = bar_mutex;
     engine->fpga_dram = fpga_dram;
-    engine->iqm = iqm;
-    engine->ipp = ipp;
     engine->devices = devices;
 
     engine->running = false;
@@ -913,10 +910,10 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
         .on_write = check_status_ipp
     };
 
-    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
-    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
-    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
-    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.c2hChannel1, &fwdfpga->bar.c2hSgdma1);
+    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
+    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
+    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
+    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.c2hChannel1, &fwdfpga->bar.c2hSgdma1);
 
     memory_region_init_io(&fwdfpga->mmio, OBJECT(fwdfpga), &fwdfpga_mmio_ops, fwdfpga,
             "fwdfpga-mmio", fwdfpga->xdma_bar_size);
