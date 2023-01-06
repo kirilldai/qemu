@@ -883,6 +883,7 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
 
     fwdfpga->bar = bar;
 
+    // Memory for IQM and IPP is allocated dynamically as thread primitives are corrupted otherwise for inexplicable reasons.
     fwdfpga->iqm = g_malloc(sizeof(Iqm));
     fwdfpga_iqm_init(fwdfpga->iqm, fwdfpga->fpga_dram);
     
