@@ -36,6 +36,8 @@
 
 #define TYPE_PCI_FWD_FPGA_DEVICE "fwdfpga"
 
+#define NUM_FPGA_DEVICES 3
+
 typedef struct FwdFpgaState FwdFpgaState;
 DECLARE_INSTANCE_CHECKER(FwdFpgaState, FWD_FPGA, TYPE_PCI_FWD_FPGA_DEVICE)
 
@@ -60,15 +62,31 @@ const size_t FPGA_IQM_OFFSET = 0x44a20000;
 const size_t FPGA_IQM_SIZE = 56;
 
 /**
+ * Offset of IPP in FPGA address space.
+*/
+const size_t FPGA_IPP_OFFSET = 0x44a10000; 
+
+/**
+ * Size of IPP register bank.
+ */
+const size_t FPGA_IPP_SIZE = 48;
+
+
+/**
  * Constants for IQM calculations from IQM HDD.
 */
 // Width in pixels of the Camera and Mapped Image.
-const uint16_t IQM_IMAGE_WIDTH = 4096;
+const uint16_t IMAGE_WIDTH = 4096;
 // Height in pixels of the Camera and Mapped Image.
-const uint16_t IQM_IMAGE_HEIGHT = 3000;
+const uint16_t IMAGE_HEIGHT = 3000;
 
 // IQM_ALPHA is used for Mapper function.
 const double IQM_ALPHA = 0.4400607;
+
+// Precalculated offsets for tiling algorithm from IPP HDD.
+const int16_t IPP_TILING_OFFSETS_FOR_WIDTH[] = {0, 0, 0, 0, 0, 0, 0, 0};
+const int16_t IPP_TILING_OFFSETS_FOR_HEIGHT[] = {0, -9, -18};
+
 
 // See Xilinx PG195 for the layout of the following structs, in particular
 // tables 5, 6 for the descriptors and the "PCIe to DMA Address Map" section
@@ -147,6 +165,37 @@ typedef struct Iqm {
     void *fpga_dram;
 } Iqm;
 
+typedef struct Ipp{
+    uint32_t control;
+    uint32_t status;
+    uint32_t error;
+    uint32_t offset;
+    uint32_t scale;
+    uint32_t input_baseaddr;
+    uint32_t input_baseaddr_msb;
+    uint32_t norm_baseaddr;
+    uint32_t norm_baseaddr_msb;
+    uint32_t tile_baseaddr;
+    uint32_t tile_baseaddr_msb;
+    uint32_t reversed;
+
+    QemuThread thread;
+    QemuMutex mutex;
+    QemuCond cv;
+    bool shutdown;
+
+    void *fpga_dram;
+} Ipp;
+
+typedef struct Device {
+    uint64_t offset;
+    uint64_t size;
+
+    void *device;
+
+    void (*on_write)(void *device);
+} Device;
+
 #pragma pack()
 
 typedef enum FwdFpgaXdmaEngineDirection {
@@ -161,7 +210,8 @@ typedef struct FwdFpgaXdmaEngine {
     XdmaSgdma* sgdma;
     QemuMutex* bar_mutex;
     void* fpga_dram;
-    Iqm* iqm;
+
+    Device* devices;
 
     QemuThread thread;
     QemuMutex mutex;
@@ -177,13 +227,17 @@ struct FwdFpgaState {
     QemuMutex bar_mutex;
     XdmaBar bar;
     void* fpga_dram;
-    Iqm iqm;
+
+    Device devices[NUM_FPGA_DEVICES];
 
     uint8_t xdma_bar_id;
     uint32_t xdma_bar_size;
 
     FwdFpgaXdmaEngine h2c_engines[2];
     FwdFpgaXdmaEngine c2h_engines[2];
+
+    Iqm* iqm;
+    Ipp* ipp;
 };
 
 static GArray* fwdfpga_xdma_engine_fetch_descriptors(FwdFpgaXdmaEngine* engine) {
@@ -236,13 +290,13 @@ static uint64_t translate_fpga_address_to_dram_offset(uint64_t address, uint64_t
     return address - FPGA_DRAM_OFFSET;
 }
 
-static uint64_t translate_fpga_address_to_iqm_offset(uint64_t address, uint64_t length) {   
-    if (address < FPGA_IQM_OFFSET ||
-        address + length > FPGA_IQM_OFFSET + FPGA_IQM_SIZE) {
+static uint64_t translate_fpga_address_to_device_offset(Device *dev, uint64_t address, uint64_t length) {
+    if (address < dev->offset ||
+        address + length > dev->offset + dev->size) {
         return ~0ULL;
     }
 
-    return address - FPGA_IQM_OFFSET;
+    return address - dev->offset;
 }
 
 static void iqm_mapper(Iqm *iqm) {
@@ -250,8 +304,8 @@ static void iqm_mapper(Iqm *iqm) {
     uint64_t mapped_offset = translate_fpga_address_to_dram_offset(iqm->map_baseaddr, 0);
 
     uint64_t pixel_offset = 0x0000000;
-    for (uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH; pixel_x++) {
-        for (uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT; pixel_y++) {
+    for (uint16_t pixel_x = 0; pixel_x < IMAGE_WIDTH; pixel_x++) {
+        for (uint16_t pixel_y = 0; pixel_y < IMAGE_HEIGHT; pixel_y++) {
             uint16_t pxl_value = 0;  
             memcpy(&pxl_value, iqm->fpga_dram + input_offset + pixel_offset, sizeof(pxl_value));
 
@@ -275,8 +329,8 @@ static void iqm_brightness_and_contrast(Iqm *iqm) {
     uint64_t bright_r = 0, bright_g = 0, bright_b = 0, bright_rgb = 0,
             contrast1 = 0, contrast2 = 0;
 
-    for (uint16_t pixel_y = 0; pixel_y < IQM_IMAGE_HEIGHT/2; pixel_y++) {
-        for (uint16_t pixel_x = 0; pixel_x < IQM_IMAGE_WIDTH/2; pixel_x++) {
+    for (uint16_t pixel_y = 0; pixel_y < IMAGE_HEIGHT/2; pixel_y++) {
+        for (uint16_t pixel_x = 0; pixel_x < IMAGE_WIDTH/2; pixel_x++) {
             uint64_t baseaddress = 0x4000 * pixel_y + 0x4 * pixel_x;
 
             uint16_t pixel_val, mx_color = 0, gray = 0;
@@ -348,67 +402,219 @@ static void* fwdfpga_iqm_thread(void* context) {
     return NULL;
 }
 
-static void check_status_iqm(Iqm *iqm, void* fpga_dram) {
+static void check_status_iqm(void *device) {
+    Iqm* iqm = (Iqm*)device;
+
     qemu_mutex_lock(&iqm->mutex);
     if (iqm->control & 1 && iqm->status == 0)
-        qemu_cond_signal(&iqm->cv);  
+        qemu_cond_signal(&iqm->cv);
     qemu_mutex_unlock(&iqm->mutex);
 }
 
-static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
-    if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) {
-        uint64_t dram_offset = translate_fpga_address_to_dram_offset(descriptor->dstAddress, descriptor->length);
-        uint64_t iqm_offset = translate_fpga_address_to_iqm_offset(descriptor->dstAddress, descriptor->length);
+/**
+* Calculate the tile position(s) of a pixel at the given row or column of
+* the image. Note that a pixel may belong to more than one tile.
+*/
+static uint8_t ipp_tile_pos(int16_t (*indices)[2], const int16_t *offsets, uint16_t image_size, uint16_t tile_size, uint16_t px_pos, uint16_t decimation) {
+    uint8_t nr_tiles = (image_size / decimation + tile_size - 1) / tile_size;
 
-        if (dram_offset != ~0ULL) {
-            if (pci_dma_read(engine->pdev, descriptor->srcAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x200; // read error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
-            }
-        } else if (iqm_offset != ~0ULL) {
-            if (pci_dma_read(engine->pdev, descriptor->srcAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x200; // read error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
-            }
+    uint16_t tiled_px_pos = px_pos / decimation,
+            index = tiled_px_pos / tile_size;
 
-            check_status_iqm(engine->iqm, engine->fpga_dram);
-        } else {
-            qemu_mutex_lock(engine->bar_mutex);
-            engine->channel->status |= 0x200; // read error
-            qemu_mutex_unlock(engine->bar_mutex);
-            return false;
-        }
-    } else {
-        uint64_t dram_offset = translate_fpga_address_to_dram_offset(descriptor->srcAddress, descriptor->length);
-        uint64_t iqm_offset = translate_fpga_address_to_iqm_offset(descriptor->srcAddress, descriptor->length);
-        
-        if (dram_offset != ~0ULL) {
-            if (pci_dma_write(engine->pdev, descriptor->dstAddress, engine->fpga_dram + dram_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x4000; // write error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
-            }
-        } else if (iqm_offset != ~0ULL) {
-            if (pci_dma_write(engine->pdev, descriptor->dstAddress, (void *)engine->iqm + iqm_offset, descriptor->length) != MEMTX_OK) {
-                qemu_mutex_lock(engine->bar_mutex);
-                engine->channel->status |= 0x4000; // write error
-                qemu_mutex_unlock(engine->bar_mutex);
-                return false;
-            }
-        } else {
-            qemu_mutex_lock(engine->bar_mutex);
-            engine->channel->status |= 0x4000; // write error
-            qemu_mutex_unlock(engine->bar_mutex);
-            return false;
+    // TODO(kirills): compute the tile indices without iterating over all tiles
+    uint8_t indices_idx = 0;
+    while (index < nr_tiles) {
+        int16_t tile_index = (tiled_px_pos - offsets[index]) / tile_size,
+                px_index = tiled_px_pos - (index * tile_size + offsets[index]);
+
+        index++;
+
+        if (px_index < 0 || px_index >= tile_size)
+            continue;
+
+        indices[indices_idx][0] = tile_index;
+        indices[indices_idx][1] = px_index;
+        indices_idx++;
+    }
+
+    return indices_idx;
+}
+
+/**
+ * Calculate the horizontal and vertical tile position(s) of a pixel at the
+ * given column and row of the image. Note that a pixel may belong to more than
+ * one tile.
+*/
+static uint8_t ipp_tile_xy(uint16_t (*tiles)[4], uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t px_x, uint16_t px_y, uint16_t decimation) {
+    uint8_t tile_x_len = (image_width / decimation + tile_size - 1) / tile_size,
+        tile_y_len = (image_height / decimation + tile_size - 1) / tile_size;
+
+    int16_t tile_x[tile_x_len][2];
+    tile_x_len = ipp_tile_pos(tile_x, IPP_TILING_OFFSETS_FOR_WIDTH, image_width, tile_size, px_x, decimation);
+
+    int16_t tile_y[tile_y_len][2];
+    tile_y_len = ipp_tile_pos(tile_y, IPP_TILING_OFFSETS_FOR_HEIGHT, image_height, tile_size, px_y, decimation);
+
+    uint8_t tiles_idx = 0;
+    for (uint8_t i = 0; i < tile_x_len; i++) {
+        for (uint8_t j = 0; j < tile_y_len; j++) {
+            tiles[tiles_idx][0] = tile_x[i][0];
+            tiles[tiles_idx][1] = tile_y[j][0];
+            tiles[tiles_idx][2] = tile_x[i][1];
+            tiles[tiles_idx][3] = tile_y[j][1];
+
+            tiles_idx++;
         }
     }
 
-    return true;
+    return tiles_idx;
+}
+
+/**
+ * Compute the memory address(es) of a pixel in a tiled format suitable for
+ * processing by the DTA.
+*/
+static uint8_t ipp_tile_addresses(uint32_t *addresses, uint16_t px_x, uint16_t px_y, uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t decimation, uint16_t batch_size, uint16_t block_size) {
+    uint16_t tiled_image_width = image_width / decimation;
+    uint8_t nr_tiles = (tiled_image_width + tile_size - 1) / tile_size;
+    uint16_t pixel_batch_size_bytes = block_size * batch_size;
+    uint32_t tile_batch_size_bytes = tile_size * tile_size * pixel_batch_size_bytes;
+
+    uint16_t tiles[2][4];
+    uint8_t tiles_sz = ipp_tile_xy(tiles, image_width, image_height, tile_size, px_x, px_y, decimation);
+
+    uint8_t block_index = 2 * (px_y % 2) + (px_x % 2);
+    uint8_t addresses_idx = 0;
+    for (uint8_t idx = 0; idx < tiles_sz; idx++) {
+        uint16_t tx = tiles[idx][0];
+        uint16_t ty = tiles[idx][1];
+        uint16_t px = tiles[idx][2];
+        uint16_t py = tiles[idx][3];
+
+        uint16_t global_tile = tx + nr_tiles * ty,
+                 batch_tile = global_tile % batch_size,
+                 batch = global_tile / batch_size;
+        uint32_t address = batch * tile_batch_size_bytes + (py * tile_size + px) * pixel_batch_size_bytes + batch_tile * block_size + block_index;
+    
+        addresses[addresses_idx++] = address;
+    }
+
+    return addresses_idx;
+}
+
+static void execute_ipp(Ipp* ipp) {
+    uint64_t input_baseaddr = (((uint64_t)ipp->input_baseaddr_msb) << 32) | ((uint64_t)ipp->input_baseaddr);
+    uint64_t input_offset = translate_fpga_address_to_dram_offset(input_baseaddr, 0);
+
+    uint64_t norm_baseaddr = (((uint64_t)ipp->norm_baseaddr_msb) << 32) | ((uint64_t)ipp->norm_baseaddr);
+    uint64_t norm_offset = translate_fpga_address_to_dram_offset(norm_baseaddr, 0);
+
+    uint64_t tile_baseaddr = (((uint64_t)ipp->norm_baseaddr_msb) << 32) | ((uint64_t)ipp->tile_baseaddr);
+    uint64_t tile_offset = translate_fpga_address_to_dram_offset(tile_baseaddr, 0);
+
+    uint64_t input_pixel_offset = 0x0000000,
+            norm_pixel_offset = 0x0000000;
+    for (uint16_t pixel_y = 0; pixel_y < IMAGE_HEIGHT/2; pixel_y++) {
+        for (uint16_t pixel_x = 0; pixel_x < IMAGE_WIDTH; pixel_x++) {
+            uint16_t pxl_value = 0;  
+            memcpy(&pxl_value, ipp->fpga_dram + input_offset + input_pixel_offset, sizeof(pxl_value));
+
+            // Formula can be found in IPP HDD
+            uint8_t norm_pxl_value = (((pxl_value * ipp->scale) >> 12) + ipp->offset + 8) >> 4;
+
+            memcpy(ipp->fpga_dram + norm_offset + norm_pixel_offset, &norm_pxl_value, sizeof(norm_pxl_value));
+
+            uint32_t addresses[2];
+            uint8_t addresses_size = ipp_tile_addresses(addresses, pixel_x, pixel_y, IMAGE_WIDTH, IMAGE_HEIGHT/2, 256, 2, 12, 16);
+
+            for (uint8_t idx = 0; idx < addresses_size; idx++)
+                memcpy(ipp->fpga_dram + tile_offset + addresses[idx], &norm_pxl_value, sizeof(norm_pxl_value));
+
+            input_pixel_offset += sizeof(pxl_value);
+            norm_pixel_offset += sizeof(norm_pxl_value);
+        }   
+    }
+}
+
+static void* fwdfpga_ipp_thread(void* context) {
+    Ipp* ipp = (Ipp*)context;
+
+    qemu_mutex_lock(&ipp->mutex);
+    
+    while (1) {
+        qemu_cond_wait(&ipp->cv, &ipp->mutex);
+
+        if (ipp->shutdown) {
+            break;
+        }
+
+        ipp->status = 1; 
+        
+        qemu_mutex_unlock(&ipp->mutex);
+        execute_ipp(ipp);
+        qemu_mutex_lock(&ipp->mutex);
+
+        ipp->control = 0;
+        ipp->status = 0;
+    }
+
+    qemu_mutex_unlock(&ipp->mutex);
+
+    return NULL;
+}
+
+static void check_status_ipp(void *device) {
+    Ipp* ipp = (Ipp*)device;
+
+    qemu_mutex_lock(&ipp->mutex);
+    if (ipp->control & 1 && ipp->status == 0)
+        qemu_cond_signal(&ipp->cv);
+    qemu_mutex_unlock(&ipp->mutex);
+}
+
+static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
+    for (uint8_t idx = 0; idx < NUM_FPGA_DEVICES; idx++) {
+        if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) {
+            uint64_t device_offset = translate_fpga_address_to_device_offset(&engine->devices[idx], descriptor->dstAddress, descriptor->length);
+
+            if (device_offset != ~0ULL) {
+                if (pci_dma_read(engine->pdev, descriptor->srcAddress, engine->devices[idx].device + device_offset, descriptor->length) != MEMTX_OK) {
+                    qemu_mutex_lock(engine->bar_mutex);
+                    engine->channel->status |= 0x200; // read error
+                    qemu_mutex_unlock(engine->bar_mutex);
+                    return false;
+                }
+
+                if (engine->devices[idx].on_write != NULL)
+                    engine->devices[idx].on_write(engine->devices[idx].device);
+
+                return true;
+            }
+        } else {
+            uint64_t device_offset = translate_fpga_address_to_device_offset(&engine->devices[idx], descriptor->srcAddress, descriptor->length);
+
+            if (device_offset != ~0ULL) {
+                if (pci_dma_write(engine->pdev, descriptor->dstAddress, engine->devices[idx].device + device_offset, descriptor->length) != MEMTX_OK) {
+                    qemu_mutex_lock(engine->bar_mutex);
+                    engine->channel->status |= 0x4000; // write error
+                    qemu_mutex_unlock(engine->bar_mutex);
+                    return false;
+                }
+
+                return true;
+            }
+        }
+    }
+
+    // If the descriptor address doesn't match any device, set an error status.
+    qemu_mutex_lock(engine->bar_mutex);
+    if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) 
+        engine->channel->status |= 0x200; // read error
+    else
+        engine->channel->status |= 0x4000; // write error
+    qemu_mutex_unlock(engine->bar_mutex);
+
+    return false;
 }
 
 static void fwdfpga_xdma_engine_run(FwdFpgaXdmaEngine* engine) {
@@ -460,14 +666,15 @@ static void* fwdfpga_xdma_engine_thread(void* context) {
     return NULL;
 }
 
-static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngineDirection direction, PCIDevice* pdev, QemuMutex* bar_mutex, void *fpga_dram, Iqm *iqm, XdmaChannel* channel, XdmaSgdma* sgdma) {
+static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngineDirection direction, PCIDevice* pdev, QemuMutex* bar_mutex, void *fpga_dram, Device *devices, XdmaChannel* channel, XdmaSgdma* sgdma) {
     engine->direction = direction;
     engine->pdev = pdev;
     engine->channel = channel;
     engine->sgdma = sgdma;
     engine->bar_mutex = bar_mutex;
     engine->fpga_dram = fpga_dram;
-    engine->iqm = iqm;
+    engine->devices = devices;
+
     engine->running = false;
     engine->shutdown = false;
 
@@ -477,6 +684,8 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
 }
 
 static void fwdfpga_iqm_init(Iqm *iqm, void* fpga_dram) {
+    memset(iqm, 0, sizeof(*iqm));
+
     iqm->fpga_dram = fpga_dram;
 
     qemu_mutex_init(&iqm->mutex);
@@ -493,6 +702,27 @@ static void fwdfpga_iqm_uninit(Iqm* iqm) {
     qemu_thread_join(&iqm->thread);
     qemu_cond_destroy(&iqm->cv);
     qemu_mutex_destroy(&iqm->mutex);
+}
+
+static void fwdfpga_ipp_init(Ipp *ipp, void* fpga_dram) {
+    memset(ipp, 0, sizeof(*ipp));
+    
+    ipp->fpga_dram = fpga_dram;
+
+    qemu_mutex_init(&ipp->mutex);
+    qemu_cond_init(&ipp->cv);
+    qemu_thread_create(&ipp->thread, "ipp", fwdfpga_ipp_thread, ipp, QEMU_THREAD_JOINABLE);
+}
+
+static void fwdfpga_ipp_uninit(Ipp* ipp) {
+    qemu_mutex_lock(&ipp->mutex);
+    ipp->shutdown = true;
+    qemu_mutex_unlock(&ipp->mutex);
+    qemu_cond_signal(&ipp->cv);
+
+    qemu_thread_join(&ipp->thread);
+    qemu_cond_destroy(&ipp->cv);
+    qemu_mutex_destroy(&ipp->mutex);
 }
 
 static void fwdfpga_xdma_engine_uninit(FwdFpgaXdmaEngine* engine) {
@@ -651,12 +881,38 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
 
     fwdfpga->bar = bar;
 
-    fwdfpga_iqm_init(&fwdfpga->iqm, fwdfpga->fpga_dram);
+    // Memory for IQM and IPP is allocated dynamically as thread primitives are corrupted otherwise for inexplicable reasons.
+    fwdfpga->iqm = g_malloc(sizeof(Iqm));
+    fwdfpga_iqm_init(fwdfpga->iqm, fwdfpga->fpga_dram);
+    
+    fwdfpga->ipp = g_malloc(sizeof(Ipp));
+    fwdfpga_ipp_init(fwdfpga->ipp, fwdfpga->fpga_dram);
 
-    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
-    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
-    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
-    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, &fwdfpga->iqm, &fwdfpga->bar.c2hChannel1, &fwdfpga->bar.c2hSgdma1);
+    fwdfpga->devices[0] = (struct Device) {
+        .offset = FPGA_DRAM_OFFSET,
+        .size = FPGA_DRAM_SIZE,
+        .device = fwdfpga->fpga_dram,
+        .on_write = NULL
+    };
+
+    fwdfpga->devices[1] = (struct Device) {
+        .offset = FPGA_IQM_OFFSET,
+        .size = FPGA_IQM_SIZE,
+        .device = fwdfpga->iqm,
+        .on_write = check_status_iqm
+    };
+    
+    fwdfpga->devices[2] = (struct Device) {
+        .offset = FPGA_IPP_OFFSET,
+        .size = FPGA_IPP_SIZE,
+        .device = fwdfpga->ipp,
+        .on_write = check_status_ipp
+    };
+
+    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
+    fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
+    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
+    fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.c2hChannel1, &fwdfpga->bar.c2hSgdma1);
 
     memory_region_init_io(&fwdfpga->mmio, OBJECT(fwdfpga), &fwdfpga_mmio_ops, fwdfpga,
             "fwdfpga-mmio", fwdfpga->xdma_bar_size);
@@ -672,7 +928,11 @@ static void pci_fwdfpga_uninit(PCIDevice *pdev)
     fwdfpga_xdma_engine_uninit(&fwdfpga->c2h_engines[0]);
     fwdfpga_xdma_engine_uninit(&fwdfpga->c2h_engines[1]);
 
-    fwdfpga_iqm_uninit(&fwdfpga->iqm);
+    fwdfpga_iqm_uninit(fwdfpga->iqm);
+    fwdfpga_ipp_uninit(fwdfpga->ipp);
+    g_free(fwdfpga->iqm);
+    g_free(fwdfpga->ipp);
+
 
     qemu_mutex_destroy(&fwdfpga->bar_mutex);
 
