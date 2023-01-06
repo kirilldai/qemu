@@ -36,7 +36,7 @@
 
 #define TYPE_PCI_FWD_FPGA_DEVICE "fwdfpga"
 
-#define NUM_FPGA_DEVICES 3
+#define NUM_FPGA_DEVICES 4
 
 typedef struct FwdFpgaState FwdFpgaState;
 DECLARE_INSTANCE_CHECKER(FwdFpgaState, FWD_FPGA, TYPE_PCI_FWD_FPGA_DEVICE)
@@ -71,6 +71,15 @@ const size_t FPGA_IPP_OFFSET = 0x44a10000;
  */
 const size_t FPGA_IPP_SIZE = 48;
 
+/**
+ * Offset of IPP in FPGA address space.
+*/
+const size_t FPGA_DTA_OFFSET = 0x44a00000; 
+
+/**
+ * Size of IPP register bank.
+ */
+const size_t FPGA_DTA_SIZE = 92;
 
 /**
  * Constants for IQM calculations from IQM HDD.
@@ -187,6 +196,39 @@ typedef struct Ipp{
     void *fpga_dram;
 } Ipp;
 
+typedef struct Dta{
+    uint32_t load_baseaddr;
+    uint32_t load_len;
+    uint32_t execute_baseaddr;
+    uint32_t execute_len;
+    uint32_t store_baseaddr;
+    uint32_t store_len;
+    uint32_t const_baseaddr;
+    uint32_t vars_baseaddr;
+    uint32_t config;
+    uint32_t control;
+    uint32_t status;
+    uint32_t exitcode;
+    uint32_t total_count;
+    uint32_t exec_idle_count;
+    uint32_t exec_stall_count;
+    uint32_t exec_stall_max_len;
+    uint32_t load_idle_count; 
+    uint32_t load_stall_count;
+    uint32_t load_stall_max_len;
+    uint32_t store_idle_count; 
+    uint32_t store_stall_count;
+    uint32_t store_stall_max_len;
+    uint32_t spec_version;
+
+    QemuThread thread;
+    QemuMutex mutex;
+    QemuCond cv;
+    bool shutdown;
+
+    void *fpga_dram;
+} Dta;
+
 typedef struct Device {
     uint64_t offset;
     uint64_t size;
@@ -238,6 +280,7 @@ struct FwdFpgaState {
 
     Iqm* iqm;
     Ipp* ipp;
+    Dta* dta;
 };
 
 static GArray* fwdfpga_xdma_engine_fetch_descriptors(FwdFpgaXdmaEngine* engine) {
@@ -572,6 +615,33 @@ static void check_status_ipp(void *device) {
     qemu_mutex_unlock(&ipp->mutex);
 }
 
+static void* fwdfpga_dta_thread(void* context) {
+    Dta* dta = (Dta*)context;
+
+    qemu_mutex_lock(&dta->mutex);
+    
+    while (1) {
+        qemu_cond_wait(&dta->cv, &dta->mutex);
+
+        if (dta->shutdown) {
+            break;
+        }
+
+        dta->status = 1; 
+        
+        qemu_mutex_unlock(&dta->mutex);
+        // execute_ipp(ipp);
+        qemu_mutex_lock(&dta->mutex);
+
+        dta->control = 0;
+        dta->status = 0;
+    }
+
+    qemu_mutex_unlock(&dta->mutex);
+
+    return NULL;
+}
+
 static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
     for (uint8_t idx = 0; idx < NUM_FPGA_DEVICES; idx++) {
         if (engine->direction == FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C) {
@@ -723,6 +793,27 @@ static void fwdfpga_ipp_uninit(Ipp* ipp) {
     qemu_thread_join(&ipp->thread);
     qemu_cond_destroy(&ipp->cv);
     qemu_mutex_destroy(&ipp->mutex);
+}
+
+static void fwdfpga_dta_init(Dta *dta, void* fpga_dram) {
+    memset(dta, 0, sizeof(*dta));
+    
+    dta->fpga_dram = fpga_dram;
+
+    qemu_mutex_init(&dta->mutex);
+    qemu_cond_init(&dta->cv);
+    qemu_thread_create(&dta->thread, "dta", fwdfpga_dta_thread, dta, QEMU_THREAD_JOINABLE);
+}
+
+static void fwdfpga_dta_uninit(Dta* dta) {
+    qemu_mutex_lock(&dta->mutex);
+    dta->shutdown = true;
+    qemu_mutex_unlock(&dta->mutex);
+    qemu_cond_signal(&dta->cv);
+
+    qemu_thread_join(&dta->thread);
+    qemu_cond_destroy(&dta->cv);
+    qemu_mutex_destroy(&dta->mutex);
 }
 
 static void fwdfpga_xdma_engine_uninit(FwdFpgaXdmaEngine* engine) {
@@ -888,6 +979,9 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
     fwdfpga->ipp = g_malloc(sizeof(Ipp));
     fwdfpga_ipp_init(fwdfpga->ipp, fwdfpga->fpga_dram);
 
+    fwdfpga->dta = g_malloc(sizeof(Dta));
+    fwdfpga_dta_init(fwdfpga->dta, fwdfpga->fpga_dram);
+
     fwdfpga->devices[0] = (struct Device) {
         .offset = FPGA_DRAM_OFFSET,
         .size = FPGA_DRAM_SIZE,
@@ -909,6 +1003,13 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
         .on_write = check_status_ipp
     };
 
+    fwdfpga->devices[3] = (struct Device) {
+        .offset = FPGA_DTA_OFFSET,
+        .size = FPGA_DTA_SIZE,
+        .device = fwdfpga->dta,
+        .on_write = NULL
+    };
+    
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[1], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.h2cChannel1, &fwdfpga->bar.h2cSgdma1);
     fwdfpga_xdma_engine_init(&fwdfpga->c2h_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_C2H, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.c2hChannel0, &fwdfpga->bar.c2hSgdma0);
@@ -930,8 +1031,10 @@ static void pci_fwdfpga_uninit(PCIDevice *pdev)
 
     fwdfpga_iqm_uninit(fwdfpga->iqm);
     fwdfpga_ipp_uninit(fwdfpga->ipp);
+    fwdfpga_dta_uninit(fwdfpga->dta);
     g_free(fwdfpga->iqm);
     g_free(fwdfpga->ipp);
+    g_free(fwdfpga->dta);
 
 
     qemu_mutex_destroy(&fwdfpga->bar_mutex);
