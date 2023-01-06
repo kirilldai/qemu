@@ -84,8 +84,8 @@ const uint16_t IMAGE_HEIGHT = 3000;
 const double IQM_ALPHA = 0.4400607;
 
 // Precalculated offsets for tiling algorithm from IPP HDD.
-const int16_t ipp_tiling_offsets_for_width[] = {0, 0, 0, 0, 0, 0, 0, 0};
-const int16_t ipp_tiling_offsets_for_height[] = {0, -9, -18};
+const int16_t IPP_TILING_OFFSETS_FOR_WIDTH[] = {0, 0, 0, 0, 0, 0, 0, 0};
+const int16_t IPP_TILING_OFFSETS_FOR_HEIGHT[] = {0, -9, -18};
 
 
 // See Xilinx PG195 for the layout of the following structs, in particular
@@ -210,8 +210,6 @@ typedef struct FwdFpgaXdmaEngine {
     XdmaSgdma* sgdma;
     QemuMutex* bar_mutex;
     void* fpga_dram;
-    Iqm* iqm;
-    Ipp* ipp;
 
     Device* devices;
 
@@ -452,10 +450,10 @@ static uint8_t ipp_tile_xy(uint16_t (*tiles)[4], uint16_t image_width, uint16_t 
         tile_y_len = (image_height / decimation + tile_size - 1) / tile_size;
 
     int16_t tile_x[tile_x_len][2];
-    tile_x_len = ipp_tile_pos(tile_x, ipp_tiling_offsets_for_width, image_width, tile_size, px_x, decimation);
+    tile_x_len = ipp_tile_pos(tile_x, IPP_TILING_OFFSETS_FOR_WIDTH, image_width, tile_size, px_x, decimation);
 
     int16_t tile_y[tile_y_len][2];
-    tile_y_len = ipp_tile_pos(tile_y, ipp_tiling_offsets_for_height, image_height, tile_size, px_y, decimation);
+    tile_y_len = ipp_tile_pos(tile_y, IPP_TILING_OFFSETS_FOR_HEIGHT, image_height, tile_size, px_y, decimation);
 
     uint8_t tiles_idx = 0;
     for (uint8_t i = 0; i < tile_x_len; i++) {
