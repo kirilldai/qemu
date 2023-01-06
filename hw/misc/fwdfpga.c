@@ -83,6 +83,11 @@ const uint16_t IMAGE_HEIGHT = 3000;
 // IQM_ALPHA is used for Mapper function.
 const double IQM_ALPHA = 0.4400607;
 
+// Precalculated offsets for tiling algorithm from IPP HDD.
+const int16_t ipp_tiling_offsets_for_width[] = {0, 0, 0, 0, 0, 0, 0, 0};
+const int16_t ipp_tiling_offsets_for_height[] = {0, -9, -18};
+
+
 // See Xilinx PG195 for the layout of the following structs, in particular
 // tables 5, 6 for the descriptors and the "PCIe to DMA Address Map" section
 // for the other structures, including tables, 40, 41, 42, 45, 48, 96, 97,
@@ -188,7 +193,7 @@ typedef struct Device {
 
     void *device;
 
-    void (*check_status)(void *device);
+    void (*on_write)(void *device);
 } Device;
 
 #pragma pack()
@@ -408,26 +413,21 @@ static void check_status_iqm(void *device) {
     qemu_mutex_unlock(&iqm->mutex);
 }
 
-static uint8_t tile_pos(int16_t (*indices)[2], uint16_t image_size, uint16_t tile_size, uint16_t px_pos, uint16_t decimation) {
-    uint8_t nr_tiles = ceil((image_size / decimation) * 1.0 / tile_size);
+/**
+* Calculate the tile position(s) of a pixel at the given row or column of
+* the image. Note that a pixel may belong to more than one tile.
+*/
+static uint8_t ipp_tile_pos(int16_t (*indices)[2], const int16_t *offsets, uint16_t image_size, uint16_t tile_size, uint16_t px_pos, uint16_t decimation) {
+    uint8_t nr_tiles = (image_size / decimation + tile_size - 1) / tile_size;
 
-    // Precalculated offsets for tiling algorithm from IPP HDD.
-    int16_t offsets_width[] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int16_t offsets_height[] = {0, -9, -18};
+    uint16_t tiled_px_pos = px_pos / decimation,
+            index = tiled_px_pos / tile_size;
 
-	uint16_t tiled_px_pos = px_pos / decimation,
-    		 index = tiled_px_pos / tile_size;
-
+    // TODO(kirills): compute the tile indices without iterating over all tiles
     uint8_t indices_idx = 0;
     while (index < nr_tiles) {
-        int16_t offset = 0;
-        if (image_size == 4096)
-            offset = offsets_width[index];
-        else if (image_size == 1500)
-            offset = offsets_height[index];
-
-        int16_t tile_index = (tiled_px_pos - offset) / tile_size,
-        		px_index = tiled_px_pos - (index * tile_size + offset);
+        int16_t tile_index = (tiled_px_pos - offsets[index]) / tile_size,
+                px_index = tiled_px_pos - (index * tile_size + offsets[index]);
 
         index++;
 
@@ -439,53 +439,63 @@ static uint8_t tile_pos(int16_t (*indices)[2], uint16_t image_size, uint16_t til
         indices_idx++;
     }
 
-	return indices_idx;
+    return indices_idx;
 }
 
-static uint8_t tile_xy(uint16_t (*tiles)[4], uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t px_x, uint16_t px_y, uint16_t decimation) {
-	uint8_t tile_x_len = ceil(1.0 * image_width / decimation / tile_size),
-		tile_y_len = ceil(1.0 * image_height / decimation / tile_size);
+/**
+ * Calculate the horizontal and vertical tile position(s) of a pixel at the
+ * given column and row of the image. Note that a pixel may belong to more than
+ * one tile.
+*/
+static uint8_t ipp_tile_xy(uint16_t (*tiles)[4], uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t px_x, uint16_t px_y, uint16_t decimation) {
+    uint8_t tile_x_len = (image_width / decimation + tile_size - 1) / tile_size,
+        tile_y_len = (image_height / decimation + tile_size - 1) / tile_size;
 
-	int16_t tile_x[tile_x_len][2];
-	tile_x_len = tile_pos(tile_x, image_width, tile_size, px_x, decimation);
+    int16_t tile_x[tile_x_len][2];
+    tile_x_len = ipp_tile_pos(tile_x, ipp_tiling_offsets_for_width, image_width, tile_size, px_x, decimation);
 
-	int16_t tile_y[tile_y_len][2];
-	tile_y_len = tile_pos(tile_y, image_height, tile_size, px_y, decimation);
+    int16_t tile_y[tile_y_len][2];
+    tile_y_len = ipp_tile_pos(tile_y, ipp_tiling_offsets_for_height, image_height, tile_size, px_y, decimation);
 
-	uint8_t tiles_idx = 0;
-	for (uint8_t i = 0; i < tile_x_len; i++)
-		for (uint8_t j = 0; j < tile_y_len; j++) {
-			tiles[tiles_idx][0] = tile_x[i][0];
-			tiles[tiles_idx][1] = tile_y[j][0];
-			tiles[tiles_idx][2] = tile_x[i][1];
-			tiles[tiles_idx][3] = tile_y[j][1];
+    uint8_t tiles_idx = 0;
+    for (uint8_t i = 0; i < tile_x_len; i++) {
+        for (uint8_t j = 0; j < tile_y_len; j++) {
+            tiles[tiles_idx][0] = tile_x[i][0];
+            tiles[tiles_idx][1] = tile_y[j][0];
+            tiles[tiles_idx][2] = tile_x[i][1];
+            tiles[tiles_idx][3] = tile_y[j][1];
 
-			tiles_idx++;
-		}
+            tiles_idx++;
+        }
+    }
 
-	return tiles_idx;
+    return tiles_idx;
 }
 
-static uint8_t tile_addresses(uint32_t *addresses, uint16_t px_x, uint16_t px_y, uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t decimation, uint16_t batch_size, uint16_t block_size) {
-	uint16_t tiled_image_width = image_width / decimation;
-    uint8_t nr_tiles = ceil(1.0 * tiled_image_width / tile_size);
+/**
+ * Compute the memory address(es) of a pixel in a tiled format suitable for
+ * processing by the DTA.
+*/
+static uint8_t ipp_tile_addresses(uint32_t *addresses, uint16_t px_x, uint16_t px_y, uint16_t image_width, uint16_t image_height, uint16_t tile_size, uint16_t decimation, uint16_t batch_size, uint16_t block_size) {
+    uint16_t tiled_image_width = image_width / decimation;
+    uint8_t nr_tiles = (tiled_image_width + tile_size - 1) / tile_size;
     uint16_t pixel_batch_size_bytes = block_size * batch_size;
     uint32_t tile_batch_size_bytes = tile_size * tile_size * pixel_batch_size_bytes;
 
     uint16_t tiles[2][4];
-    uint8_t tiles_sz = tile_xy(tiles, image_width, image_height, tile_size, px_x, px_y, decimation);
+    uint8_t tiles_sz = ipp_tile_xy(tiles, image_width, image_height, tile_size, px_x, px_y, decimation);
 
     uint8_t block_index = 2 * (px_y % 2) + (px_x % 2);
     uint8_t addresses_idx = 0;
     for (uint8_t idx = 0; idx < tiles_sz; idx++) {
-    	uint16_t tx = tiles[idx][0],
-	    		ty = tiles[idx][1],
-	    		px = tiles[idx][2],
-	    		py = tiles[idx][3];
+        uint16_t tx = tiles[idx][0];
+        uint16_t ty = tiles[idx][1];
+        uint16_t px = tiles[idx][2];
+        uint16_t py = tiles[idx][3];
 
-    	uint16_t global_tile = tx + nr_tiles * ty,
-        		 batch_tile = global_tile % batch_size,
-        		 batch = global_tile / batch_size;
+        uint16_t global_tile = tx + nr_tiles * ty,
+                 batch_tile = global_tile % batch_size,
+                 batch = global_tile / batch_size;
         uint32_t address = batch * tile_batch_size_bytes + (py * tile_size + px) * pixel_batch_size_bytes + batch_tile * block_size + block_index;
     
         addresses[addresses_idx++] = address;
@@ -495,8 +505,6 @@ static uint8_t tile_addresses(uint32_t *addresses, uint16_t px_x, uint16_t px_y,
 }
 
 static void execute_ipp(Ipp* ipp) {
-    double scale = (double)ipp->scale / (double)(1 << 12);
-
     uint64_t input_baseaddr = (((uint64_t)ipp->input_baseaddr_msb) << 32) | ((uint64_t)ipp->input_baseaddr);
     uint64_t input_offset = translate_fpga_address_to_dram_offset(input_baseaddr, 0);
 
@@ -514,13 +522,13 @@ static void execute_ipp(Ipp* ipp) {
             memcpy(&pxl_value, ipp->fpga_dram + input_offset + input_pixel_offset, sizeof(pxl_value));
 
             // Formula can be found in IPP HDD
-            pxl_value = floor((scale * pxl_value + ipp->offset) / 16.0 + 0.5);
+            pxl_value = (((pxl_value * ipp->scale) >> 12) + ipp->offset + 8) >> 4;
 
             uint8_t norm_pxl_value = pxl_value;            
             memcpy(ipp->fpga_dram + norm_offset + norm_pixel_offset, &norm_pxl_value, sizeof(norm_pxl_value));
 
             uint32_t addresses[2];
-    	    uint8_t addresses_size = tile_addresses(addresses, pixel_x, pixel_y, IMAGE_WIDTH, IMAGE_HEIGHT/2, 256, 2, 12, 16);
+            uint8_t addresses_size = ipp_tile_addresses(addresses, pixel_x, pixel_y, IMAGE_WIDTH, IMAGE_HEIGHT/2, 256, 2, 12, 16);
 
             for (uint8_t idx = 0; idx < addresses_size; idx++)
                 memcpy(ipp->fpga_dram + tile_offset + addresses[idx], &norm_pxl_value, sizeof(norm_pxl_value));
@@ -580,8 +588,8 @@ static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, co
                     return false;
                 }
 
-                if (engine->devices[idx].check_status != NULL)
-                    engine->devices[idx].check_status(engine->devices[idx].device);
+                if (engine->devices[idx].on_write != NULL)
+                    engine->devices[idx].on_write(engine->devices[idx].device);
 
                 return true;
             }
@@ -888,21 +896,21 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
         .offset = FPGA_DRAM_OFFSET,
         .size = FPGA_DRAM_SIZE,
         .device = fwdfpga->fpga_dram,
-        .check_status = NULL
+        .on_write = NULL
     };
 
     fwdfpga->devices[1] = (struct Device) {
         .offset = FPGA_IQM_OFFSET,
         .size = FPGA_IQM_SIZE,
         .device = fwdfpga->iqm,
-        .check_status = check_status_iqm
+        .on_write = check_status_iqm
     };
     
     fwdfpga->devices[2] = (struct Device) {
         .offset = FPGA_IPP_OFFSET,
         .size = FPGA_IPP_SIZE,
         .device = fwdfpga->ipp,
-        .check_status = check_status_ipp
+        .on_write = check_status_ipp
     };
 
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->iqm, fwdfpga->ipp, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
