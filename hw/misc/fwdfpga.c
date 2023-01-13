@@ -23,6 +23,7 @@
  */
 
 #include <math.h>
+#include <time.h>
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
@@ -97,6 +98,87 @@ const int16_t IPP_TILING_OFFSETS_FOR_WIDTH[] = {0, 0, 0, 0, 0, 0, 0, 0};
 const int16_t IPP_TILING_OFFSETS_FOR_HEIGHT[] = {0, -9, -18};
 
 
+// DTA Constants
+const uint8_t DTA_UOP_SRAM_BANK_ID = 0;
+const uint8_t DTA_BIAS_SRAM_BANK_ID = 8;
+const uint8_t DTA_WGT_SRAM_BANK_ID = 16;
+const uint8_t DTA_VAL_SRAM_BANK_ID = 24;
+
+const uint16_t DTA_DRAM_DATA_WIDTH = 512;
+const uint16_t DTA_DRAM_WORD_SIZE = DTA_DRAM_DATA_WIDTH / 8;
+const uint16_t DTA_BATCH_SIZE = 12;
+const uint16_t DTA_BLOCK_SIZE = 16;
+const uint16_t DTA_UOP_SIZE = 8;
+
+
+typedef struct Field{
+    uint8_t lsb;
+    uint8_t msb;
+} Field;
+
+typedef struct DataType {
+    uint64_t width;
+    bool sign;
+} DataType;
+
+typedef struct SramBuffer {
+    uint64_t width;
+    uint64_t depth; 
+} SramBuffer;
+
+typedef struct Uop {
+	uint64_t opcode;
+	uint64_t inp_base_index;
+    uint64_t wgt_base_index;
+	int64_t immediate;
+} Uop;
+
+const Field MEM_CTRL_FIELD = {.lsb = 0, .msb = 3};
+const Field SRAM_BANK_ID = {.lsb = 4, .msb = 9};
+const Field SRAM_BASE_INDEX_FIELD = {.lsb = 10, .msb = 22};
+const Field NUM_BLOCKS_FIELD = {.lsb = 23, .msb = 36};
+const Field BLOCK_SIZE_FIELD = {.lsb = 37, .msb = 42};
+const Field DATA_SIZE_FIELF = {.lsb = 43, .msb = 62};
+const Field DRAM_BASE_INDEX_FIELD = {.lsb = 63, .msb = 88};
+const Field LAST_INSTRUCTION_FIELD = {.lsb = 89, .msb = 89};
+
+const Field OUT_BASE_INDEX_FIELD = {.lsb = 4, .msb = 16};
+const Field BIAS_BASE_INDEX_FIELD = {.lsb = 17, .msb = 24};
+const Field UOP_BASE_INDEX_FIELD = {.lsb = 25, .msb = 38};
+const Field UOP_LOOP_SIZE_FIELD = {.lsb = 39, .msb = 47};
+const Field OUTER_LOOP_SIZE_FIELD = {.lsb = 48, .msb = 56};
+const Field INNER_LOOP_SIZE_FIELD = {.lsb = 57, .msb = 65};
+const Field INP_INDEX_INCR_OUT_FIELD = {.lsb = 66, .msb = 73};
+const Field OUT_INDEX_INCR_OUT_FIELD = {.lsb = 74, .msb = 81};
+const Field WGT_INDEX_INCR_OUT_FIELD = {.lsb = 82, .msb = 89};
+const Field INP_INDEX_INCR_IN_FIELD = {.lsb = 90, .msb = 97};
+const Field OUT_INDEX_INCR_IN_FIELD = {.lsb = 98, .msb = 105};
+const Field WGT_INDEX_INCR_IN_FIELD = {.lsb = 106, .msb = 113};
+const Field TAIL_SHR_IMM_FIELD = {.lsb = 114, .msb = 118};
+const Field TAIL_MAX_IMM_FIELD = {.lsb = 119, .msb = 126};
+
+const Field OPCODE_FIELD = {.lsb = 0, .msb = 2};
+const Field INP_BASE_INDEX_FIELD = {.lsb = 3, .msb = 15};
+const Field WGT_BASE_INDEX_FIELD = {.lsb = 16, .msb = 27};
+const Field IMMEDIATE_FIELD = {.lsb = 28, .msb = 59};
+
+const DataType BIAS_TYPE = {.width = 64, .sign = true};
+const DataType VAL_TYPE = {.width = 8, .sign = false};
+const DataType WGT_TYPE = {.width = 8, .sign = true};
+
+const SramBuffer BIAS_BUFFER = {
+    .width = (BIAS_TYPE.width / 8) * DTA_BLOCK_SIZE / DTA_DRAM_WORD_SIZE, 
+    .depth = 256
+};
+const SramBuffer VAL_BUFFER = {
+    .width = (VAL_TYPE.width / 8) * DTA_BATCH_SIZE * DTA_BLOCK_SIZE / DTA_DRAM_WORD_SIZE, 
+    .depth = 6144
+};
+const SramBuffer WGT_BUFFER = {
+    .width = (WGT_TYPE.width / 8) * DTA_BLOCK_SIZE * DTA_BLOCK_SIZE / DTA_DRAM_WORD_SIZE, 
+    .depth = 4096
+};
+
 // See Xilinx PG195 for the layout of the following structs, in particular
 // tables 5, 6 for the descriptors and the "PCIe to DMA Address Map" section
 // for the other structures, including tables, 40, 41, 42, 45, 48, 96, 97,
@@ -166,15 +248,16 @@ typedef struct Iqm {
     uint32_t contrast2;
     uint32_t contrast2_msb;
 
-    QemuThread thread;
-    QemuMutex mutex;
-    QemuCond cv;
+    QemuThread* thread;
+    QemuMutex* mutex;
+    QemuCond* cv;
     bool shutdown;
 
+    QemuMutex* fpga_dram_mutex;
     void *fpga_dram;
 } Iqm;
 
-typedef struct Ipp{
+typedef struct Ipp {
     uint32_t control;
     uint32_t status;
     uint32_t error;
@@ -188,15 +271,26 @@ typedef struct Ipp{
     uint32_t tile_baseaddr_msb;
     uint32_t reversed;
 
-    QemuThread thread;
-    QemuMutex mutex;
-    QemuCond cv;
+    QemuThread* thread;
+    QemuMutex* mutex;
+    QemuCond* cv;
     bool shutdown;
 
+    QemuMutex* fpga_dram_mutex;
     void *fpga_dram;
 } Ipp;
 
-typedef struct Dta{
+typedef struct DtaModule {
+    char *name;
+    void* (*thread_executer)(void *dta);
+
+    QemuThread* thread;
+    QemuMutex* mutex;
+    QemuCond* cv;
+    bool shutdown;
+} DtaModule;
+
+typedef struct Dta {
     uint32_t load_baseaddr;
     uint32_t load_len;
     uint32_t execute_baseaddr;
@@ -221,13 +315,63 @@ typedef struct Dta{
     uint32_t store_stall_max_len;
     uint32_t spec_version;
 
-    QemuThread thread;
-    QemuMutex mutex;
-    QemuCond cv;
+    uint64_t uop_sram_bank[16384];
+    uint64_t bias_sram_bank[4096];
+    int8_t wgt_sram_bank[1048576];
+    uint8_t val_sram_bank[1179648];
+
+    uint8_t load_producer_semaphore;
+    uint8_t load_consumer_semaphore;
+    uint8_t execute_producer_semaphore;
+    uint8_t execute_consumer_semaphore;
+    uint8_t store_producer_semaphore;
+    uint8_t store_consumer_semaphore;
+    
+    DtaModule load;
+    DtaModule execute;
+    DtaModule store;
+
+    bool load_finished;
+    bool execute_finished;
+    bool store_finished;
+
+    QemuThread* thread;
+    QemuMutex* mutex;
+    QemuCond* cv;
     bool shutdown;
+    QemuMutex* fpga_dram_mutex;
 
     void *fpga_dram;
 } Dta;
+
+typedef struct TransferInstruction {
+    uint8_t mem_ctrl;
+    uint8_t sram_bank_id;
+    uint16_t sram_base_index;
+    uint16_t num_blocks;
+    uint8_t block_size;
+    uint32_t data_size;
+    uint64_t dram_base_index;
+    uint8_t last_instruction;
+} TransferInstruction;
+
+typedef struct ExecuteInstruction {
+    uint8_t mem_ctrl;
+    uint16_t out_base_index;
+    uint8_t bias_base_index;
+    uint16_t uop_base_index;
+    uint16_t uop_loop_size;
+    uint16_t outer_loop_size;
+    uint16_t inner_loop_size;
+    uint8_t inp_index_incr_out;
+    uint8_t out_index_incr_out;
+    uint8_t wgt_index_incr_out;
+    uint8_t inp_index_incr_in;
+    uint8_t out_index_incr_in;
+    uint8_t wgt_index_incr_in;
+    uint8_t tail_shr_imm;
+    uint8_t tail_max_imm;
+} ExecuteInstruction;
 
 typedef struct Device {
     uint64_t offset;
@@ -237,6 +381,12 @@ typedef struct Device {
 
     void (*on_write)(void *device);
 } Device;
+
+typedef struct SramOffsets {
+	uint64_t inp;
+	uint64_t out;
+    uint64_t wgt;
+} SramOffsets;
 
 #pragma pack()
 
@@ -281,6 +431,8 @@ struct FwdFpgaState {
     Iqm* iqm;
     Ipp* ipp;
     Dta* dta;
+
+    QemuMutex* fpga_dram_mutex;
 };
 
 static GArray* fwdfpga_xdma_engine_fetch_descriptors(FwdFpgaXdmaEngine* engine) {
@@ -422,25 +574,31 @@ static void execute_iqm(Iqm* iqm) {
 static void* fwdfpga_iqm_thread(void* context) {
     Iqm* iqm = (Iqm*)context;
 
-    qemu_mutex_lock(&iqm->mutex);
+    qemu_mutex_lock(iqm->mutex);
     
     while (1) {
-        qemu_cond_wait(&iqm->cv, &iqm->mutex);
+        qemu_cond_wait(iqm->cv, iqm->mutex);
         if (iqm->shutdown) {
             break;
         }
 
         iqm->status = 1;
 
-        qemu_mutex_unlock(&iqm->mutex);
+        qemu_mutex_unlock(iqm->mutex);
+        // info_report("Locking iqm dram mutex %p", iqm->fpga_dram_mutex);
+
+        // qemu_mutex_lock(iqm->fpga_dram_mutex);
         execute_iqm(iqm);
-        qemu_mutex_lock(&iqm->mutex);
+        // info_report("Unlocking iqm dram mutex %p", iqm->fpga_dram_mutex);
+        // qemu_mutex_unlock(iqm->fpga_dram_mutex);
+
+        qemu_mutex_lock(iqm->mutex);
 
         iqm->control = 0;
         iqm->status = 0;
     }
 
-    qemu_mutex_unlock(&iqm->mutex);
+    qemu_mutex_unlock(iqm->mutex);
 
     return NULL;
 }
@@ -448,10 +606,10 @@ static void* fwdfpga_iqm_thread(void* context) {
 static void check_status_iqm(void *device) {
     Iqm* iqm = (Iqm*)device;
 
-    qemu_mutex_lock(&iqm->mutex);
+    qemu_mutex_lock(iqm->mutex);
     if (iqm->control & 1 && iqm->status == 0)
-        qemu_cond_signal(&iqm->cv);
-    qemu_mutex_unlock(&iqm->mutex);
+        qemu_cond_signal(iqm->cv);
+    qemu_mutex_unlock(iqm->mutex);
 }
 
 /**
@@ -582,10 +740,10 @@ static void execute_ipp(Ipp* ipp) {
 static void* fwdfpga_ipp_thread(void* context) {
     Ipp* ipp = (Ipp*)context;
 
-    qemu_mutex_lock(&ipp->mutex);
+    qemu_mutex_lock(ipp->mutex);
     
     while (1) {
-        qemu_cond_wait(&ipp->cv, &ipp->mutex);
+        qemu_cond_wait(ipp->cv, ipp->mutex);
 
         if (ipp->shutdown) {
             break;
@@ -593,15 +751,21 @@ static void* fwdfpga_ipp_thread(void* context) {
 
         ipp->status = 1; 
         
-        qemu_mutex_unlock(&ipp->mutex);
+        qemu_mutex_unlock(ipp->mutex);
+        // info_report("Locking ipp dram mutex %p", ipp->fpga_dram_mutex);
+
+        // qemu_mutex_lock(ipp->fpga_dram_mutex);
         execute_ipp(ipp);
-        qemu_mutex_lock(&ipp->mutex);
+        // info_report("Unlocking ipp dram mutex %p", ipp->fpga_dram_mutex);
+        // qemu_mutex_unlock(ipp->fpga_dram_mutex);
+
+        qemu_mutex_lock(ipp->mutex);
 
         ipp->control = 0;
         ipp->status = 0;
     }
 
-    qemu_mutex_unlock(&ipp->mutex);
+    qemu_mutex_unlock(ipp->mutex);
 
     return NULL;
 }
@@ -609,37 +773,747 @@ static void* fwdfpga_ipp_thread(void* context) {
 static void check_status_ipp(void *device) {
     Ipp* ipp = (Ipp*)device;
 
-    qemu_mutex_lock(&ipp->mutex);
+    qemu_mutex_lock(ipp->mutex);
     if (ipp->control & 1 && ipp->status == 0)
-        qemu_cond_signal(&ipp->cv);
-    qemu_mutex_unlock(&ipp->mutex);
+        qemu_cond_signal(ipp->cv);
+    qemu_mutex_unlock(ipp->mutex);
+}
+
+static uint64_t extract_value(uint64_t part1, uint64_t part2, Field field){
+    if(field.lsb < 64 && field.msb < 64)
+        return (part1 & (((uint64_t)1 << (field.msb + 1)) - 1)) >> field.lsb;
+
+    if(field.lsb >= 64 && field.msb >= 64)
+        return (part2 & (((uint64_t)1 << (field.msb - 64 + 1)) - 1)) >> (field.lsb - 64);
+    
+    return ((part2 & (((uint64_t)1 << (field.msb - 64 + 1)) - 1)) << (64 - field.lsb)) | (part1 >> field.lsb);
+}
+
+static TransferInstruction read_transfer_instruction(int64_t addreess, void *fpga_dram){
+    uint64_t part1 = 0, part2 = 0;
+
+    memcpy(&part1, fpga_dram + addreess, sizeof(part1));
+    memcpy(&part2, fpga_dram + addreess + sizeof(uint64_t), sizeof(part2));
+
+    TransferInstruction instr = {
+        .mem_ctrl = extract_value(part1, part2, MEM_CTRL_FIELD),
+        .sram_bank_id = extract_value(part1, part2, SRAM_BANK_ID),
+        .sram_base_index = extract_value(part1, part2, SRAM_BASE_INDEX_FIELD),
+        .num_blocks = extract_value(part1, part2, NUM_BLOCKS_FIELD),
+        .block_size = extract_value(part1, part2, BLOCK_SIZE_FIELD),
+        .data_size = extract_value(part1, part2, DATA_SIZE_FIELF),
+        .dram_base_index = extract_value(part1, part2, DRAM_BASE_INDEX_FIELD),
+        .last_instruction = extract_value(part1, part2, LAST_INSTRUCTION_FIELD)
+    };
+
+    return instr;
+}
+
+static ExecuteInstruction read_execute_instruction(int64_t addreess, void *fpga_dram){
+    uint64_t part1 = 0, part2 = 0;
+
+    memcpy(&part1, fpga_dram + addreess, sizeof(part1));
+    memcpy(&part2, fpga_dram + addreess + sizeof(uint64_t), sizeof(part2));
+
+    ExecuteInstruction instr = {
+        .mem_ctrl = extract_value(part1, part2, MEM_CTRL_FIELD),
+        .out_base_index = extract_value(part1, part2, OUT_BASE_INDEX_FIELD),
+        .bias_base_index = extract_value(part1, part2, BIAS_BASE_INDEX_FIELD),
+        .uop_base_index = extract_value(part1, part2, UOP_BASE_INDEX_FIELD),
+        .uop_loop_size = extract_value(part1, part2, UOP_LOOP_SIZE_FIELD),
+        .outer_loop_size = extract_value(part1, part2, OUTER_LOOP_SIZE_FIELD),
+        .inner_loop_size = extract_value(part1, part2, INNER_LOOP_SIZE_FIELD),
+        .inp_index_incr_out = extract_value(part1, part2, INP_INDEX_INCR_OUT_FIELD),
+        .out_index_incr_out = extract_value(part1, part2, OUT_INDEX_INCR_OUT_FIELD),
+        .wgt_index_incr_out = extract_value(part1, part2, WGT_INDEX_INCR_OUT_FIELD),
+        .inp_index_incr_in = extract_value(part1, part2, INP_INDEX_INCR_IN_FIELD),
+        .out_index_incr_in = extract_value(part1, part2, OUT_INDEX_INCR_IN_FIELD),
+        .wgt_index_incr_in = extract_value(part1, part2, WGT_INDEX_INCR_IN_FIELD),
+        .tail_shr_imm = extract_value(part1, part2, TAIL_SHR_IMM_FIELD),
+        .tail_max_imm = extract_value(part1, part2, TAIL_MAX_IMM_FIELD)
+    };
+
+    return instr;
+}
+
+static void dta_process_load_instruction(TransferInstruction *instr, Dta *dta, int instr_idx){
+    void *dram = NULL, *sram = NULL;
+
+    qemu_mutex_lock(dta->mutex);
+    if (instr->sram_bank_id == DTA_UOP_SRAM_BANK_ID){
+        dram = dta->fpga_dram + dta->const_baseaddr;
+        sram = dta->uop_sram_bank;
+    } else if(instr->sram_bank_id == DTA_BIAS_SRAM_BANK_ID){
+        dram = dta->fpga_dram + dta->const_baseaddr;
+        sram = &dta->bias_sram_bank;
+    } else if(instr->sram_bank_id == DTA_WGT_SRAM_BANK_ID){
+        dram = dta->fpga_dram + dta->const_baseaddr;
+        sram = dta->wgt_sram_bank;
+    } else if(instr->sram_bank_id == DTA_VAL_SRAM_BANK_ID){
+        dram = dta->fpga_dram + dta->vars_baseaddr;
+        sram = dta->val_sram_bank;
+    }
+
+    qemu_mutex_unlock(dta->mutex);
+    
+    uint64_t dram_index = instr->dram_base_index,
+        sram_index = instr->sram_base_index;
+
+    for (uint64_t i = 0; i < (instr->data_size + 1) / (instr->block_size + 1); i++) {
+        for (uint64_t b = 0; b <= instr->block_size; b++) {
+            uint64_t dram_addr = dram_index * DTA_DRAM_WORD_SIZE;
+            uint64_t sram_addr = (sram_index * (instr->block_size + 1) + b) * DTA_DRAM_WORD_SIZE;
+
+            qemu_mutex_lock(dta->mutex);
+            memcpy(sram + sram_addr, dram + dram_addr, DTA_DRAM_WORD_SIZE);
+            // if(instr_idx <= 5 && instr->sram_bank_id == DTA_VAL_SRAM_BANK_ID){
+            //     info_report("Sram address %p", sram);
+            //     info_report("Sram address + %p", sram + sram_addr);
+            //     info_report("Load instruction from DRAM %ld to SRAM %ld", dram_addr, sram_addr);
+            
+            //     for(int i = 0; i < 16; i++)
+            //         info_report("Values in address %p is %d", dta->val_sram_bank + sram_addr + i, *(dta->val_sram_bank + sram_addr + i));
+            // }
+
+            if(instr->sram_bank_id == DTA_VAL_SRAM_BANK_ID && sram_addr == 176640){
+                uint8_t test[64];
+                memcpy(&test, dram + dram_addr, DTA_DRAM_WORD_SIZE);
+
+                info_report("Writing to address val %d from DRAM addres %ld", test[0], dram_addr);
+            }
+
+            if(instr_idx <= 5 && dram_addr == 0){
+                uint8_t test[64];
+                memcpy(&test, dram + dram_addr, DTA_DRAM_WORD_SIZE);
+
+                info_report("First element in dram addr 0 is %d", test[0]);
+            }
+
+            qemu_mutex_unlock(dta->mutex);
+            
+            dram_index++;
+        }
+        sram_index++;
+    }
+}
+
+static uint64_t dta_block_size(SramBuffer buffer){
+    return buffer.width* DTA_DRAM_WORD_SIZE;
+}
+
+static Uop dta_read_uop(uint64_t uop_bytes){
+    Uop uop = {
+        .opcode = extract_value(uop_bytes, 0, OPCODE_FIELD),
+        .inp_base_index = extract_value(uop_bytes, 0, INP_BASE_INDEX_FIELD),
+        .wgt_base_index = extract_value(uop_bytes, 0, WGT_BASE_INDEX_FIELD),
+        .immediate = extract_value(uop_bytes, 0, IMMEDIATE_FIELD),
+    };
+
+    return uop;
+}
+
+static void dta_saturate(int64_t *acc_tensor, uint64_t width, bool sign){
+    int64_t min = 0;
+    int64_t max = ((int64_t)1 << width) - 1;
+
+    if(sign){
+        min = -((int64_t)1 << (width - 1));
+        max = ((int64_t)1 << (width - 1)) - 1;
+    }
+
+    for(uint16_t i = 0; i < DTA_BATCH_SIZE * DTA_BLOCK_SIZE; i++){
+        if(acc_tensor[i] > max)
+            acc_tensor[i] = max;
+        else if (acc_tensor[i] < min)
+            acc_tensor[i] = min;
+    }
+}
+
+static void executeTail(int64_t *acc_tensor, int64_t shr_imm, int64_t max_imm) {
+	for (uint16_t i = 0; i < DTA_BATCH_SIZE * DTA_BLOCK_SIZE; i++) {
+		acc_tensor[i] = acc_tensor[i] >> shr_imm;
+
+		if (max_imm > acc_tensor[i])
+			acc_tensor[i] = max_imm;
+	}
+
+	dta_saturate(acc_tensor, VAL_TYPE.width, VAL_TYPE.sign);
+}
+
+static char *intToChar_int8(size_t n, int8_t *numArray, size_t m, char *charArray) 
+{    
+    int pos = 0;
+    while(n--)
+        pos += snprintf(charArray + pos, m - pos, "%d%s", *numArray++, n ? " " : "");
+    return charArray;
+}
+
+static char *intToChar(size_t n, uint8_t *numArray, size_t m, char *charArray) 
+{    
+    int pos = 0;
+    while(n--)
+        pos += snprintf(charArray + pos, m - pos, "%d%s", *numArray++, n ? " " : "");
+    return charArray;
+}
+
+static void dta_process_execute_instruction(ExecuteInstruction *instr, Dta *dta, int instr_number) {
+    int64_t acc_tensor[DTA_BATCH_SIZE * DTA_BLOCK_SIZE];
+
+    SramOffsets outer_offsets = {
+        .inp = 0,
+        .out = 0,
+        .wgt = 0
+    };
+
+    // if(instr_number < 2){
+    //     info_report("Instruction %d", instr_number);
+    //     info_report("mem_ctrl %d", instr->mem_ctrl);
+    //     info_report("out_base_index %d", instr->out_base_index);
+    //     info_report("bias_base_index %d", instr->bias_base_index);
+    //     info_report("uop_base_index %d", instr->uop_base_index);
+    //     info_report("uop_loop_size %d", instr->uop_loop_size);
+    //     info_report("outer_loop_size %d", instr->outer_loop_size);
+    //     info_report("inner_loop_size %d", instr->inner_loop_size);
+    //     info_report("inp_index_incr_out %d", instr->inp_index_incr_out);
+    //     info_report("out_index_incr_out %d", instr->out_index_incr_out);
+    //     info_report("wgt_index_incr_out %d", instr->wgt_index_incr_out);
+    //     info_report("inp_index_incr_in %d", instr->inp_index_incr_in);
+    //     info_report("out_index_incr_in %d", instr->out_index_incr_in);
+    //     info_report("wgt_index_incr_in %d", instr->wgt_index_incr_in);
+    //     info_report("tail_shr_imm %d", instr->tail_shr_imm);
+    //     info_report("tail_max_imm %d", instr->tail_max_imm);
+    // }
+
+    // info_report("%d, %d, %d", instr->outer_loop_size, instr->inner_loop_size, instr->uop_loop_size);
+
+    for (uint64_t i_outer = 0; i_outer <= instr->outer_loop_size; i_outer++){
+        SramOffsets inner_offsets = outer_offsets;
+
+        for(uint64_t i_inner = 0; i_inner <= instr->inner_loop_size; i_inner++){
+            uint64_t bias_index = instr->bias_base_index + i_inner;
+            uint64_t *bias_pointer = dta->bias_sram_bank + bias_index * dta_block_size(BIAS_BUFFER) / 8;
+            
+            // if(i_outer == 0 && i_inner < 2 && instr_number < 10){
+            //     info_report("Bias pointer %ld", bias_index * dta_block_size(BIAS_BUFFER));
+                
+            //     for (uint64_t o = 0; o < DTA_BLOCK_SIZE; o++)
+            //         info_report("I inner %ld. Bias #%ld is %ld", i_inner, o, *(bias_pointer + o));
+            // }
+
+            for (uint64_t i_uop = 0; i_uop <= instr->uop_loop_size; i_uop++){
+                Uop uop = dta_read_uop(*(dta->uop_sram_bank + (instr->uop_base_index + i_uop)));
+
+                uint64_t inp_index = uop.inp_base_index + inner_offsets.inp;
+                uint8_t *inp_tensor_pointer = dta->val_sram_bank + inp_index * dta_block_size(VAL_BUFFER);
+
+                // if(i_uop < 2 && i_outer == 0 && i_inner == 0 && instr_number < 10){                    
+                //     info_report("Address %ld", inp_index * dta_block_size(VAL_BUFFER));
+                //     info_report("Real address %p", inp_tensor_pointer);
+                //     for (uint64_t o = 0; o < DTA_BATCH_SIZE * DTA_BLOCK_SIZE; o++)
+                //         info_report("I inner %ld. Iuop #%ld is %d. Address %p", i_uop, o, *(inp_tensor_pointer + o), (inp_tensor_pointer + o));
+                // }
+
+
+                uint64_t wgt_index = uop.wgt_base_index + inner_offsets.wgt;
+                int8_t *wgt_tensor_pointer = dta->wgt_sram_bank + wgt_index * dta_block_size(WGT_BUFFER);
+                
+
+                for (uint64_t b = 0; b < DTA_BATCH_SIZE; b++) {
+                    for (uint64_t o = 0; o < DTA_BLOCK_SIZE; o++) {
+                        int64_t *acc = &acc_tensor[b * DTA_BLOCK_SIZE + o];
+                        // int64_t copy_of_acc = acc_tensor[b * DTA_BLOCK_SIZE + o];
+                        
+                        if(uop.opcode == 5 || uop.opcode == 6 || uop.opcode == 7){
+                            int64_t bias = *(bias_pointer + o);
+
+                            if (uop.opcode == 5){
+                                *acc = bias;
+                                for (uint64_t c = 0; c < DTA_BLOCK_SIZE; c++)
+                                    *acc += *(inp_tensor_pointer + b * DTA_BLOCK_SIZE + c) * *(wgt_tensor_pointer + o * DTA_BLOCK_SIZE + c) * uop.immediate;
+                            } else if (uop.opcode == 6){
+                                for (uint64_t c = 0; c < DTA_BLOCK_SIZE; c++)
+                                    *acc += *(inp_tensor_pointer + b * DTA_BLOCK_SIZE + c) * *(wgt_tensor_pointer + o * DTA_BLOCK_SIZE + c) * uop.immediate;
+                            } else if (uop.opcode == 7){
+                                int64_t factor = uop.immediate & ((1 << 18) - 1);
+                                int64_t imm = uop.immediate >> 18;
+
+                                for (uint64_t c = 0; c < DTA_BLOCK_SIZE; c++)
+                                    *acc += imm * *(wgt_tensor_pointer + o * DTA_BLOCK_SIZE + c) * factor;
+                            }
+                        }
+                        else{
+                            uint64_t inp = *(inp_tensor_pointer + b * DTA_BLOCK_SIZE + o);
+
+                            if (uop.opcode == 0) {
+                                *acc = uop.immediate;
+                            } else if (uop.opcode == 1) {
+                                *acc = inp;
+                            } else if (uop.opcode == 2) {
+                                if (inp > *acc)
+                                    *acc = inp;
+                            } else if (uop.opcode == 3) {
+                                int64_t imm = uop.immediate >> 18;
+                                *acc = *acc + inp + imm;
+                            } else if (uop.opcode == 4) {
+                                *acc = *acc + inp * uop.immediate;
+                            }
+                        }
+
+                        // info_report("REsult of execution %ld, %ld", copy_of_acc, acc_tensor[b * DTA_BLOCK_SIZE + o]);
+                    }
+                }
+
+                // if(i_outer == 150 && i_inner == 0 && instr_number == 71){
+                //     info_report("Uop opcode %ld", uop.opcode);
+    
+                //     char *charArray = (char*)malloc(4 * DTA_BATCH_SIZE * DTA_BLOCK_SIZE - 1);
+                //     uint8_t vals[DTA_BATCH_SIZE*DTA_BLOCK_SIZE];
+                //     memcpy(&vals,  dta->val_sram_bank + inp_index * dta_block_size(VAL_BUFFER), DTA_BATCH_SIZE*DTA_BLOCK_SIZE);
+                //     (void)intToChar_int8;
+                //     info_report("%ld [%s]", inp_index * dta_block_size(VAL_BUFFER), intToChar(DTA_BLOCK_SIZE * DTA_BATCH_SIZE, vals, DTA_BLOCK_SIZE * DTA_BATCH_SIZE * 4, charArray));
+    
+                // }
+
+                // if(uop.opcode <= 4 && instr_number <= 10){
+                //     char *charArray = (char*)malloc(4 * DTA_BATCH_SIZE * DTA_BLOCK_SIZE - 1);
+            
+                //     info_report("Instruction #%d. [%s]", instr_number, intToChar(DTA_BATCH_SIZE * DTA_BLOCK_SIZE, acc_tensor, DTA_BATCH_SIZE * DTA_BLOCK_SIZE * 4, charArray));
+                // }
+
+            }
+
+            executeTail(acc_tensor, instr->tail_shr_imm, instr->tail_max_imm);
+
+
+
+            uint64_t out_index = instr->out_base_index + inner_offsets.out;
+
+            uint8_t acc_tensor_8_bit[DTA_BATCH_SIZE * DTA_BLOCK_SIZE];
+            for(int i = 0; i < DTA_BATCH_SIZE * DTA_BLOCK_SIZE; i++)
+                acc_tensor_8_bit[i] = (uint8_t)acc_tensor[i];
+                        
+            // if(i_outer == 0 && i_inner == 0 && instr_number < 10){                    
+            //     info_report("Instruction %d. Acc tensor values", instr_number);
+            //     for (uint64_t o = 0; o < DTA_BATCH_SIZE * DTA_BLOCK_SIZE; o++)
+            //         info_report("%d", acc_tensor_8_bit[o]);
+            // }
+            char *charArray = (char*)malloc(4 * DTA_BATCH_SIZE * DTA_BLOCK_SIZE - 1);
+            (void)intToChar_int8;
+            // if(i_outer == 150 && i_inner == 0 && instr_number == 71){
+                info_report("%d %ld %ld [%s]", instr_number, i_outer, i_inner, intToChar(DTA_BATCH_SIZE * DTA_BLOCK_SIZE, acc_tensor_8_bit, DTA_BATCH_SIZE * DTA_BLOCK_SIZE * 4, charArray));
+            // }
+
+            memcpy(dta->val_sram_bank + out_index * dta_block_size(VAL_BUFFER), &acc_tensor_8_bit, sizeof(acc_tensor_8_bit));
+
+            inner_offsets.inp += instr->inp_index_incr_in;
+            inner_offsets.out += instr->out_index_incr_in;
+            inner_offsets.wgt += instr->wgt_index_incr_in;
+        }
+
+        outer_offsets.inp += instr->inp_index_incr_out;
+        outer_offsets.out += instr->out_index_incr_out;
+        outer_offsets.wgt += instr->wgt_index_incr_out;
+    }
+}
+
+static void dta_process_store_instruction(TransferInstruction *instr, Dta *dta, int instr_idx) {
+    uint64_t dram_index = instr->dram_base_index,
+        sram_index = instr->sram_base_index;
+
+    for (uint64_t i = 0; i < (instr->data_size + 1) / (instr->block_size + 1); i++) {
+        for (uint64_t b = 0; b <= instr->block_size; b++) {
+            uint64_t dram_addr = dram_index * DTA_DRAM_WORD_SIZE;
+            uint64_t sram_addr = (sram_index * (instr->block_size + 1) + b) * DTA_DRAM_WORD_SIZE;
+        
+            qemu_mutex_lock(dta->mutex);
+            memcpy(dta->fpga_dram + dta->vars_baseaddr + dram_addr, dta->val_sram_bank + sram_addr, DTA_DRAM_WORD_SIZE);
+
+            // if(instr_idx < 10){
+            //     uint8_t vals[DTA_DRAM_WORD_SIZE];
+            //     memcpy(&vals, dta->val_sram_bank + sram_addr, DTA_DRAM_WORD_SIZE);
+            //     char *charArray = (char*)malloc(4 * DTA_DRAM_WORD_SIZE - 1);
+
+            //     info_report("Writing batch for instruction %d", instr_idx);
+            //     info_report("[%s]",  intToChar(DTA_DRAM_WORD_SIZE, vals, DTA_DRAM_WORD_SIZE * 4, charArray));
+            // }
+
+            qemu_mutex_unlock(dta->mutex);
+   
+            dram_index++;
+        }
+        sram_index++;
+    }
+}
+
+static void* dta_load_thread(void* context){
+    Dta* dta = (Dta*)context;
+
+    qemu_mutex_lock(dta->load.mutex);
+    
+    while (1) {
+        qemu_cond_wait(dta->load.cv, dta->load.mutex);
+        
+        if (dta->load.shutdown) {
+            break;
+        }
+
+        qemu_mutex_unlock(dta->load.mutex);
+
+        uint64_t instr_offset = 0;
+        uint16_t idx = 0;
+
+
+        qemu_mutex_lock(dta->mutex);
+        uint64_t load_instr_len = dta->load_len;
+        qemu_mutex_unlock(dta->mutex);
+
+        while (idx < load_instr_len) {
+            qemu_mutex_lock(dta->mutex);
+            TransferInstruction instr = read_transfer_instruction(dta->load_baseaddr + instr_offset, dta->fpga_dram);
+            qemu_mutex_unlock(dta->mutex);
+
+            // info_report("load read instruction #%d MemCtrl %d", idx, instr.mem_ctrl);
+
+            if(instr.mem_ctrl & 1)
+                while(1){
+                    bool flag = false;
+                    qemu_mutex_lock(dta->mutex);
+                    if(dta->execute_consumer_semaphore != 0){
+                        flag = true;
+                        dta->execute_consumer_semaphore --;
+                    }
+                    qemu_mutex_unlock(dta->mutex);
+                    if(flag)
+                        break;
+                }
+            if(instr.mem_ctrl & 2)
+                while(1){
+                    bool flag = false;
+                    qemu_mutex_lock(dta->mutex);
+                    if(dta->store_producer_semaphore != 0){
+                        flag = true;
+                        dta->store_producer_semaphore--;
+                    }
+                    qemu_mutex_unlock(dta->mutex);
+                    if(flag)
+                        break;
+                }
+
+            dta_process_load_instruction(&instr, dta, idx);
+                        
+            instr_offset += 2 * sizeof(uint64_t);
+            idx++;
+
+            if(instr.mem_ctrl & 4){
+                qemu_mutex_lock(dta->mutex);
+                dta->load_producer_semaphore++;
+                qemu_mutex_unlock(dta->mutex);
+            }
+            if(instr.mem_ctrl & 8){
+                qemu_mutex_lock(dta->mutex);
+                dta->load_consumer_semaphore++;
+                qemu_mutex_unlock(dta->mutex);
+            }
+        }
+        // info_report("Load module finsihed");
+
+        qemu_mutex_lock(dta->mutex);
+        dta->load_finished = true;
+        // info_report("Load module finsihed");
+        qemu_mutex_unlock(dta->mutex);
+
+        qemu_mutex_lock(dta->load.mutex);
+    }
+
+    qemu_mutex_unlock(dta->load.mutex);
+    return NULL;
+}
+
+static void* dta_execute_thread(void* context){
+    Dta* dta = (Dta*)context;
+
+    qemu_mutex_lock(dta->execute.mutex);
+    
+    while (1) {
+        qemu_cond_wait(dta->execute.cv, dta->execute.mutex);
+        
+        if (dta->execute.shutdown) {
+            break;
+        }
+
+        qemu_mutex_unlock(dta->execute.mutex);
+
+        uint64_t instr_offset = 0;
+        uint16_t idx = 0;
+
+        time_t seconds;
+     
+        seconds = time(NULL);
+
+        qemu_mutex_lock(dta->mutex);
+        uint64_t execute_instr_len = dta->execute_len;
+        qemu_mutex_unlock(dta->mutex);
+
+
+        // for(int i = 0; i < 256; i++)
+        //     info_report("Bias index #%d  --  %ld", i, dta->bias_sram_bank[i]);
+
+        while (idx < execute_instr_len) {
+            qemu_mutex_lock(dta->mutex);
+            ExecuteInstruction instr = read_execute_instruction(dta->execute_baseaddr + instr_offset, dta->fpga_dram);
+            qemu_mutex_unlock(dta->mutex);
+
+            // if(idx % 100 == 0)
+            //     info_report("execute read instruction #%d", idx);
+
+            if(instr.mem_ctrl & 1)
+                while(1){
+                    bool flag = false;
+                    qemu_mutex_lock(dta->mutex);
+                    if(dta->store_consumer_semaphore != 0){
+                        flag = true;
+                        dta->store_consumer_semaphore --;
+                    }
+                    qemu_mutex_unlock(dta->mutex);
+                    if(flag)
+                        break;
+                }
+            if(instr.mem_ctrl & 2)
+                while(1){
+                    bool flag = false;
+                    qemu_mutex_lock(dta->mutex);
+                    if(dta->load_producer_semaphore != 0){
+                        flag = true;
+                        dta->load_producer_semaphore--;
+                    }
+                    qemu_mutex_unlock(dta->mutex);
+                    if(flag)
+                        break;
+                }
+
+            dta_process_execute_instruction(&instr, dta, idx);
+                        
+            instr_offset += 2 * sizeof(uint64_t);
+            idx++;
+
+            if(instr.mem_ctrl & 4){
+                qemu_mutex_lock(dta->mutex);
+                dta->execute_producer_semaphore++;
+                qemu_mutex_unlock(dta->mutex);
+            }
+            if(instr.mem_ctrl & 8){
+                qemu_mutex_lock(dta->mutex);
+                dta->execute_consumer_semaphore++;
+                qemu_mutex_unlock(dta->mutex);
+            }
+        }
+        // info_report("execute module finsihed");
+
+        qemu_mutex_lock(dta->mutex);
+        info_report("Execution of dta finished in %ld", time(NULL) - seconds);
+        dta->execute_finished = true;
+        // info_report("execute module finsihed");
+
+        qemu_mutex_unlock(dta->mutex);
+
+        qemu_mutex_lock(dta->execute.mutex);
+    }
+
+    qemu_mutex_unlock(dta->execute.mutex);
+    return NULL;
+}
+
+static void* dta_store_thread(void* context){
+    Dta* dta = (Dta*)context;
+
+    qemu_mutex_lock(dta->store.mutex);
+    
+    while (1) {
+        qemu_cond_wait(dta->store.cv, dta->store.mutex);
+        
+        if (dta->store.shutdown) {
+            break;
+        }
+
+        qemu_mutex_unlock(dta->store.mutex);
+
+        uint64_t instr_offset = 0;
+        uint16_t idx = 0;
+
+
+        qemu_mutex_lock(dta->mutex);
+        uint64_t store_instr_len = dta->store_len;
+        qemu_mutex_unlock(dta->mutex);
+
+        while (idx < store_instr_len) {
+            qemu_mutex_lock(dta->mutex);
+            TransferInstruction instr = read_transfer_instruction(dta->store_baseaddr + instr_offset, dta->fpga_dram);
+            
+            qemu_mutex_unlock(dta->mutex);
+
+            // info_report("storeer read instruction #%d MemCtrl %d", idx, instr.mem_ctrl);
+
+            if(instr.mem_ctrl & 1)
+                while(1){
+                    bool flag = false;
+                    qemu_mutex_lock(dta->mutex);
+                    if(dta->load_consumer_semaphore != 0){
+                        flag = true;
+                        dta->load_consumer_semaphore --;
+                    }
+                    qemu_mutex_unlock(dta->mutex);
+                    if(flag)
+                        break;
+                }
+            if(instr.mem_ctrl & 2)
+                while(1){
+                    // info_report("waiting for execute-producer_semaphore");
+                    bool flag = false;
+                    qemu_mutex_lock(dta->mutex);
+                    if(dta->execute_producer_semaphore != 0){
+                        flag = true;
+                        dta->execute_producer_semaphore--;
+                    }
+                    qemu_mutex_unlock(dta->mutex);
+                    if(flag)
+                        break;
+                }
+
+            dta_process_store_instruction(&instr, dta, idx);
+                        
+            instr_offset += 2 * sizeof(uint64_t);
+            idx++;
+
+            if(instr.mem_ctrl & 4){
+                qemu_mutex_lock(dta->mutex);
+                dta->store_producer_semaphore++;
+                qemu_mutex_unlock(dta->mutex);
+            }
+            if(instr.mem_ctrl & 8){
+                qemu_mutex_lock(dta->mutex);
+                dta->store_consumer_semaphore++;
+                qemu_mutex_unlock(dta->mutex);
+            }
+        }
+        // info_report("store module finsihed");
+
+        qemu_mutex_lock(dta->mutex);
+        dta->store_finished = true;
+
+        // info_report("store module finsihed");
+        qemu_mutex_unlock(dta->mutex);
+
+        qemu_mutex_lock(dta->store.mutex);
+    }
+
+    qemu_mutex_unlock(dta->store.mutex);
+
+    return NULL;
+}
+
+static void execute_dta(Dta* dta){
+    // info_report("Starting DTA execution");
+
+    // info_report("Number of instructions %d %d %d", dta->load_len, dta->execute_len, dta->store_len);
+
+    // info_report("=====================");
+
+    // for(uint64_t i = 0; i < 25165824; i++){
+    //     uint8_t val = 0;
+        
+    //     memcpy(&val, dta->fpga_dram + dta->vars_baseaddr + i, 1);
+
+    //     info_report("x%ldx%08x", i, val);
+    // }
+
+
+    // info_report("=====================");
+
+
+    // uint8_t test[1];
+    // memcpy(&test, dta->fpga_dram + dta->vars_baseaddr + 963072, 1);
+
+    // info_report("First element in dram addr 963072 is %d", test[0]);
+
+    qemu_mutex_lock(dta->load.mutex);
+    qemu_cond_signal(dta->load.cv);
+    qemu_mutex_unlock(dta->load.mutex);
+
+    qemu_mutex_lock(dta->execute.mutex);
+    qemu_cond_signal(dta->execute.cv);
+    qemu_mutex_unlock(dta->execute.mutex);
+
+    qemu_mutex_lock(dta->store.mutex);
+    qemu_cond_signal(dta->store.cv);
+    qemu_mutex_unlock(dta->store.mutex);
+
+    // info_report("Finishing DTA execution");
 }
 
 static void* fwdfpga_dta_thread(void* context) {
     Dta* dta = (Dta*)context;
 
-    qemu_mutex_lock(&dta->mutex);
-    
+    qemu_mutex_lock(dta->mutex);
     while (1) {
-        qemu_cond_wait(&dta->cv, &dta->mutex);
+        qemu_cond_wait(dta->cv, dta->mutex);
 
         if (dta->shutdown) {
             break;
         }
 
         dta->status = 1; 
+
+        dta->load_finished = false;
+        dta->execute_finished = false;
+        dta->store_finished = false;
         
-        qemu_mutex_unlock(&dta->mutex);
-        // execute_ipp(ipp);
-        qemu_mutex_lock(&dta->mutex);
+        qemu_mutex_unlock(dta->mutex);
 
-        dta->control = 0;
-        dta->status = 0;
+
+        // info_report("Locking dta dram mutex %p", dta->fpga_dram_mutex);
+        // qemu_mutex_lock(dta->fpga_dram_mutex);
+        execute_dta(dta);
+        // info_report("Unlocking dta dram mutex %p", dta->fpga_dram_mutex);
+        //   qemu_mutex_unlock(dta->fpga_dram_mutex);
+
+
+        while(1){
+            qemu_mutex_lock(dta->mutex);
+
+            if(dta->load_finished && dta->execute_finished && dta->store_finished){
+                // info_report("Dta can change status after finishing of all modules");
+
+                dta->status = 2;
+                dta->control = 0;
+
+                // info_report("Old exitcode is %d", dta->exitcode);
+                dta->exitcode = 1;
+
+                qemu_mutex_unlock(dta->mutex);
+                break;
+            }
+
+            qemu_mutex_unlock(dta->mutex);
+
+        }
+
+        qemu_mutex_lock(dta->mutex);
     }
-
-    qemu_mutex_unlock(&dta->mutex);
+    qemu_mutex_unlock(dta->mutex);
 
     return NULL;
+}
+
+static void check_status_dta(void *device) {
+    Dta* dta = (Dta*)device;
+
+    qemu_mutex_lock(dta->mutex);
+    if(dta->exitcode == 0 && dta->status == 2)
+        dta->status = 0;
+    
+    if (dta->control & 1 && dta->status == 0)
+        qemu_cond_signal(dta->cv);
+    qemu_mutex_unlock(dta->mutex);
 }
 
 static bool fwdfpga_xdma_engine_execute_descriptor(FwdFpgaXdmaEngine* engine, const XdmaDescriptor* descriptor) {
@@ -756,64 +1630,106 @@ static void fwdfpga_xdma_engine_init(FwdFpgaXdmaEngine* engine, FwdFpgaXdmaEngin
 static void fwdfpga_iqm_init(Iqm *iqm, void* fpga_dram) {
     memset(iqm, 0, sizeof(*iqm));
 
+    iqm->mutex = g_malloc0(sizeof(QemuMutex));
+    iqm->cv = g_malloc0(sizeof(QemuCond));
+    iqm->thread = g_malloc0(sizeof(QemuThread));
+
     iqm->fpga_dram = fpga_dram;
 
-    qemu_mutex_init(&iqm->mutex);
-    qemu_cond_init(&iqm->cv);
-    qemu_thread_create(&iqm->thread, "iqm", fwdfpga_iqm_thread, iqm, QEMU_THREAD_JOINABLE);
+    qemu_mutex_init(iqm->mutex);
+    qemu_cond_init(iqm->cv);
+    qemu_thread_create(iqm->thread, "iqm", fwdfpga_iqm_thread, iqm, QEMU_THREAD_JOINABLE);
 }
 
 static void fwdfpga_iqm_uninit(Iqm* iqm) {
-    qemu_mutex_lock(&iqm->mutex);
+    qemu_mutex_lock(iqm->mutex);
     iqm->shutdown = true;
-    qemu_mutex_unlock(&iqm->mutex);
-    qemu_cond_signal(&iqm->cv);
+    qemu_mutex_unlock(iqm->mutex);
+    qemu_cond_signal(iqm->cv);
 
-    qemu_thread_join(&iqm->thread);
-    qemu_cond_destroy(&iqm->cv);
-    qemu_mutex_destroy(&iqm->mutex);
+    qemu_thread_join(iqm->thread);
+    qemu_cond_destroy(iqm->cv);
+    qemu_mutex_destroy(iqm->mutex);
 }
 
 static void fwdfpga_ipp_init(Ipp *ipp, void* fpga_dram) {
     memset(ipp, 0, sizeof(*ipp));
     
+    ipp->mutex = g_malloc0(sizeof(QemuMutex));
+    ipp->cv = g_malloc0(sizeof(QemuCond));
+    ipp->thread = g_malloc0(sizeof(QemuThread));
+
     ipp->fpga_dram = fpga_dram;
 
-    qemu_mutex_init(&ipp->mutex);
-    qemu_cond_init(&ipp->cv);
-    qemu_thread_create(&ipp->thread, "ipp", fwdfpga_ipp_thread, ipp, QEMU_THREAD_JOINABLE);
+    qemu_mutex_init(ipp->mutex);
+    qemu_cond_init(ipp->cv);
+    qemu_thread_create(ipp->thread, "ipp", fwdfpga_ipp_thread, ipp, QEMU_THREAD_JOINABLE);
 }
 
 static void fwdfpga_ipp_uninit(Ipp* ipp) {
-    qemu_mutex_lock(&ipp->mutex);
+    qemu_mutex_lock(ipp->mutex);
     ipp->shutdown = true;
-    qemu_mutex_unlock(&ipp->mutex);
-    qemu_cond_signal(&ipp->cv);
+    qemu_mutex_unlock(ipp->mutex);
+    qemu_cond_signal(ipp->cv);
 
-    qemu_thread_join(&ipp->thread);
-    qemu_cond_destroy(&ipp->cv);
-    qemu_mutex_destroy(&ipp->mutex);
+    qemu_thread_join(ipp->thread);
+    qemu_cond_destroy(ipp->cv);
+    qemu_mutex_destroy(ipp->mutex);
 }
 
 static void fwdfpga_dta_init(Dta *dta, void* fpga_dram) {
     memset(dta, 0, sizeof(*dta));
-    
+      
+    dta->mutex = g_malloc0(sizeof(QemuMutex));
+    dta->cv = g_malloc0(sizeof(QemuCond));
+    dta->thread = g_malloc0(sizeof(QemuThread));
+
+    dta->load.name = (char*)"load";
+    dta->load.thread_executer = &dta_load_thread;
+
+    dta->execute.name = (char*)"execute";
+    dta->execute.thread_executer = &dta_execute_thread;
+
+    dta->store.name = (char*)"store";
+    dta->store.thread_executer = &dta_store_thread;
+
     dta->fpga_dram = fpga_dram;
 
-    qemu_mutex_init(&dta->mutex);
-    qemu_cond_init(&dta->cv);
-    qemu_thread_create(&dta->thread, "dta", fwdfpga_dta_thread, dta, QEMU_THREAD_JOINABLE);
+    qemu_mutex_init(dta->mutex);
+    qemu_cond_init(dta->cv);
+    qemu_thread_create(dta->thread, "dta", fwdfpga_dta_thread, dta, QEMU_THREAD_JOINABLE);
 }
 
 static void fwdfpga_dta_uninit(Dta* dta) {
-    qemu_mutex_lock(&dta->mutex);
+    qemu_mutex_lock(dta->mutex);
     dta->shutdown = true;
-    qemu_mutex_unlock(&dta->mutex);
-    qemu_cond_signal(&dta->cv);
+    qemu_mutex_unlock(dta->mutex);
+    qemu_cond_signal(dta->cv);
 
-    qemu_thread_join(&dta->thread);
-    qemu_cond_destroy(&dta->cv);
-    qemu_mutex_destroy(&dta->mutex);
+    qemu_thread_join(dta->thread);
+    qemu_cond_destroy(dta->cv);
+    qemu_mutex_destroy(dta->mutex);
+}
+
+static void fwdfpga_dta_module_init(DtaModule *dta_module, Dta *dta) {
+    dta_module->mutex = g_malloc0(sizeof(QemuMutex));
+    dta_module->cv = g_malloc0(sizeof(QemuCond));
+    dta_module->thread = g_malloc0(sizeof(QemuThread));
+
+    qemu_mutex_init(dta_module->mutex);
+    qemu_cond_init(dta_module->cv);
+    qemu_thread_create(dta_module->thread, dta_module->name, dta_module->thread_executer, dta, QEMU_THREAD_JOINABLE);
+}
+
+static void fwdfpga_dta_module_uninit(DtaModule *dta_module, Dta* dta) {
+    qemu_mutex_lock(dta_module->mutex);
+    dta_module->shutdown = true;
+    qemu_mutex_unlock(dta_module->mutex);
+    qemu_cond_signal(dta_module->cv);
+
+    qemu_thread_join(dta_module->thread);
+    qemu_cond_destroy(dta_module->cv);
+    qemu_mutex_destroy(dta_module->mutex);
 }
 
 static void fwdfpga_xdma_engine_uninit(FwdFpgaXdmaEngine* engine) {
@@ -958,6 +1874,9 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
 
     qemu_mutex_init(&fwdfpga->bar_mutex);
 
+    fwdfpga->fpga_dram_mutex = g_malloc0(sizeof(QemuMutex));
+    qemu_mutex_init(fwdfpga->fpga_dram_mutex);
+
     const XdmaBar bar = {
             .h2cChannel0 = {.identifier = 0x1fc00006, .alignment = 0x00010106},
             .h2cChannel1 = {.identifier = 0x1fc00106, .alignment = 0x00010106},
@@ -975,12 +1894,24 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
     // Memory for IQM and IPP is allocated dynamically as thread primitives are corrupted otherwise for inexplicable reasons.
     fwdfpga->iqm = g_malloc(sizeof(Iqm));
     fwdfpga_iqm_init(fwdfpga->iqm, fwdfpga->fpga_dram);
+    fwdfpga->iqm->fpga_dram_mutex = fwdfpga->fpga_dram_mutex;
     
     fwdfpga->ipp = g_malloc(sizeof(Ipp));
     fwdfpga_ipp_init(fwdfpga->ipp, fwdfpga->fpga_dram);
+    fwdfpga->ipp->fpga_dram_mutex = fwdfpga->fpga_dram_mutex;
 
     fwdfpga->dta = g_malloc(sizeof(Dta));
     fwdfpga_dta_init(fwdfpga->dta, fwdfpga->fpga_dram);
+    fwdfpga->dta->fpga_dram_mutex = fwdfpga->fpga_dram_mutex;
+
+
+    fwdfpga_dta_module_init(&fwdfpga->dta->load, fwdfpga->dta);
+    fwdfpga_dta_module_init(&fwdfpga->dta->execute, fwdfpga->dta);
+    fwdfpga_dta_module_init(&fwdfpga->dta->store, fwdfpga->dta);
+
+    // (void)fwdfpga_dta_load_init;
+    // (void)fwdfpga_dta_execute_init;
+    // (void)fwdfpga_dta_store_init;
 
     fwdfpga->devices[0] = (struct Device) {
         .offset = FPGA_DRAM_OFFSET,
@@ -1007,7 +1938,7 @@ static void pci_fwdfpga_realize(PCIDevice *pdev, Error **errp)
         .offset = FPGA_DTA_OFFSET,
         .size = FPGA_DTA_SIZE,
         .device = fwdfpga->dta,
-        .on_write = NULL
+        .on_write = check_status_dta
     };
     
     fwdfpga_xdma_engine_init(&fwdfpga->h2c_engines[0], FWD_FPGA_XDMA_ENGINE_DIRECTION_H2C, &fwdfpga->pdev, &fwdfpga->bar_mutex, fwdfpga->fpga_dram, fwdfpga->devices, &fwdfpga->bar.h2cChannel0, &fwdfpga->bar.h2cSgdma0);
@@ -1032,10 +1963,14 @@ static void pci_fwdfpga_uninit(PCIDevice *pdev)
     fwdfpga_iqm_uninit(fwdfpga->iqm);
     fwdfpga_ipp_uninit(fwdfpga->ipp);
     fwdfpga_dta_uninit(fwdfpga->dta);
+
+    fwdfpga_dta_module_uninit(&fwdfpga->dta->load, fwdfpga->dta);
+    fwdfpga_dta_module_uninit(&fwdfpga->dta->execute, fwdfpga->dta);
+    fwdfpga_dta_module_uninit(&fwdfpga->dta->store, fwdfpga->dta);
+
     g_free(fwdfpga->iqm);
     g_free(fwdfpga->ipp);
     g_free(fwdfpga->dta);
-
 
     qemu_mutex_destroy(&fwdfpga->bar_mutex);
 
