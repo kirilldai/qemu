@@ -546,6 +546,9 @@ typedef enum X86Seg {
 #define MSR_IA32_L3_MASK_0              0x00000c90u
 #define MSR_IA32_L2_MASK_0              0x00000d10u
 
+#define MSR_MSR_TEMPERATURE_TARGET      0x000001A2u
+#define MSR_IA32_PACKAGE_THERM_STATUS   0x000001B1u
+
 #define XSTATE_FP_BIT                   0
 #define XSTATE_SSE_BIT                  1
 #define XSTATE_YMM_BIT                  2
@@ -935,6 +938,7 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define CPUID_XSAVE_XSAVES     (1U << 3)
 
 #define CPUID_6_EAX_ARAT       (1U << 2)
+#define CPUID_6_EAX_PTM        (1U << 6)
 
 /* CPUID[0x80000007].EDX flags: */
 #define CPUID_APM_INVTSC       (1U << 8)
@@ -1979,6 +1983,7 @@ struct ArchCPU {
     int32_t hv_max_vps;
 
     bool emulate_rdt_a;
+    bool emulate_ptm;
 };
 
 #ifndef CONFIG_USER_ONLY
