@@ -903,6 +903,8 @@ static void dta_process_load_instruction(TransferInstruction *instr, Dta *dta, i
 
 static void dta_process_execute_instruction(ExecuteInstruction *instr, Dta *dta, int instr_number) {
     int64_t acc_tensor[DTA_BATCH_SIZE * DTA_BLOCK_SIZE];
+    for(int i = 0; i < DTA_BATCH_SIZE * DTA_BLOCK_SIZE; i++)
+        acc_tensor[i] = 0;
 
     SramOffsets outer_offsets = {
         .inp = 0,
