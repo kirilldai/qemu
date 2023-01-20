@@ -23,7 +23,6 @@
  */
 
 #include <math.h>
-#include <time.h>
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
