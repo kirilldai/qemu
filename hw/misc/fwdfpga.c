@@ -686,7 +686,6 @@ static uint8_t ipp_tile_addresses(uint32_t *addresses, uint16_t px_x, uint16_t p
                  batch_tile = global_tile % batch_size,
                  batch = global_tile / batch_size;
         uint32_t address = batch * tile_batch_size_bytes + (py * tile_size + px) * pixel_batch_size_bytes + batch_tile * block_size + block_index;
-
         addresses[addresses_idx++] = address;
     }
 
