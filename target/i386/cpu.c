@@ -1617,6 +1617,7 @@ typedef struct X86CPUDefinition {
     const X86CPUVersionDefinition *versions;
     const char *deprecation_note;
     const bool force_rdt_a_emulation;
+    const bool force_ptm_emulation;
 } X86CPUDefinition;
 
 /* Reference to a specific CPU model version */
@@ -3851,6 +3852,7 @@ static const X86CPUDefinition builtin_x86_defs[] = {
         .xlevel = 0x80000008,
         .model_id = "Intel Core Processor (Tigerlake)",
         .force_rdt_a_emulation = true,
+        .force_ptm_emulation = true,
     },
     {
         .name = "Opteron_G1",
@@ -5206,6 +5208,10 @@ static void x86_cpu_load_model(X86CPU *cpu, X86CPUModel *model)
         cpu->emulate_rdt_a = true;
     }
 
+    if (def->force_ptm_emulation) {
+        cpu->emulate_ptm = true;
+    }
+
     /*
      * Properties in versioned CPU model are not user specified features.
      * We can simply clear env->user_features here since it will be filled later
@@ -5449,6 +5455,9 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         *ebx = 0;
         *ecx = 0;
         *edx = 0;
+        if (cpu->emulate_ptm) {
+          *eax |= CPUID_6_EAX_PTM;
+        }
         break;
     case 7:
         /* Structured Extended Feature Flags Enumeration Leaf */
@@ -7200,6 +7209,8 @@ static Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("x-migrate-smi-count", X86CPU, migrate_smi_count,
                      true),
     DEFINE_PROP_BOOL("emulate-rdt-a", X86CPU, emulate_rdt_a,
+                     false),
+    DEFINE_PROP_BOOL("emulate-ptm", X86CPU, emulate_ptm,
                      false),
     /*
      * lecacy_cache defaults to true unless the CPU model provides its

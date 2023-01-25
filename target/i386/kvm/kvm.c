@@ -2501,6 +2501,25 @@ static bool kvm_wrmsr_ia32_l3_mask(X86CPU *const cpu, const uint32_t msr, const 
     return true;
 }
 
+static bool kvm_rdmsr_ptm(X86CPU *const cpu, const uint32_t msr, uint64_t * const val)
+{
+    switch (msr) {
+    case MSR_IA32_PACKAGE_THERM_STATUS: {
+        *val = 75 << 16; // 75 degrees below threshold
+        break;
+    }
+    case MSR_MSR_TEMPERATURE_TARGET: {
+        *val = 100 << 16; // 100 degrees threshold
+        break;
+    }
+    default: {
+        assert(false);
+        break;
+    }
+    }
+    return true;
+}
+
 static Notifier smram_machine_done;
 static KVMMemoryListener smram_listener;
 static AddressSpace smram_address_space;
@@ -3604,6 +3623,16 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
                               kvm_rdmsr_ia32_l2_mask, kvm_wrmsr_ia32_l2_mask)!= 0);
             assert(kvm_filter_msr_range(s, MSR_IA32_L3_MASK_0, MAX_ARCH_L3_COS,
                               kvm_rdmsr_ia32_l3_mask, kvm_wrmsr_ia32_l3_mask)!= 0);
+        }
+
+        if (cpu->emulate_ptm) {
+            // If ptm is enabled then we shall support MSR_MSR_TEMPERATURE_TARGET and MSR_IA32_PACKAGE_THERM_STATUS
+            KVMState *const s = KVM_STATE(current_accel());
+
+            assert(kvm_filter_msr(s, MSR_MSR_TEMPERATURE_TARGET,
+                               kvm_rdmsr_ptm, NULL)!= 0);
+            assert(kvm_filter_msr(s, MSR_IA32_PACKAGE_THERM_STATUS,
+                               kvm_rdmsr_ptm, NULL)!= 0);
         }
 
         /* Note: MSR_IA32_FEATURE_CONTROL is written separately, see
